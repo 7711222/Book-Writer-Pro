@@ -21,18 +21,24 @@ from __future__ import annotations
 import asyncio
 import threading
 from collections import deque
-from typing import Any, Deque, Dict, List, Optional, Set
+from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 
 # A terminal event of this type ends a job's stream.
 TERMINAL_TYPES = {"done", "error"}
 
+# (sequence id, event) — the seq is monotonically increasing per book (never
+# reset, even across jobs) so SSE ``id:`` fields / ``Last-Event-ID`` reconnects
+# can tell "already seen" from "new" without ambiguity.
+SeqEvent = Tuple[int, Dict[str, Any]]
+
 
 class _BookChannel:
     def __init__(self, ring_size: int) -> None:
-        self.ring: Deque[Dict[str, Any]] = deque(maxlen=ring_size)
-        self.subscribers: Set["asyncio.Queue[Dict[str, Any]]"] = set()
+        self.ring: Deque[SeqEvent] = deque(maxlen=ring_size)
+        self.subscribers: Set["asyncio.Queue[SeqEvent]"] = set()
         self.running: bool = False
         self.finished: bool = True  # True once a terminal event has been seen
+        self.next_seq: int = 0  # per-book monotonic event counter
 
 
 class EventBroker:
@@ -51,17 +57,20 @@ class EventBroker:
         self._loop = loop
 
     def _ensure_loop(self) -> None:
-        """Capture the running event loop if not already bound.
+        """Capture the current running event loop.
 
         Called from async request handlers (subscribe), so it always runs on the
-        server's loop. This makes loop wiring robust whether or not the ASGI
-        startup lifespan fired (e.g. under httpx ASGITransport it does not).
+        server's loop. Refreshed on EVERY subscribe: under a real single-loop
+        server this is a no-op re-assignment, while under Starlette's TestClient
+        (where each request may run on a fresh portal loop) it keeps publishes
+        pointed at a live loop instead of one that closed with an earlier
+        request. This makes loop wiring robust whether or not the ASGI startup
+        lifespan fired (e.g. under httpx ASGITransport it does not).
         """
-        if self._loop is None:
-            try:
-                self._loop = asyncio.get_running_loop()
-            except RuntimeError:
-                pass
+        try:
+            self._loop = asyncio.get_running_loop()
+        except RuntimeError:
+            pass
 
     def _channel(self, book_id: str) -> _BookChannel:
         ch = self._channels.get(book_id)
@@ -99,7 +108,9 @@ class EventBroker:
         """
         with self._lock:
             ch = self._channel(book_id)
-            ch.ring.append(event)
+            seq = ch.next_seq
+            ch.next_seq += 1
+            ch.ring.append((seq, event))
             if event.get("type") in TERMINAL_TYPES:
                 ch.running = False
                 ch.finished = True
@@ -108,19 +119,26 @@ class EventBroker:
         if loop is None:
             return
         for q in subscribers:
-            loop.call_soon_threadsafe(_safe_put, q, event)
+            try:
+                loop.call_soon_threadsafe(_safe_put, q, (seq, event))
+            except RuntimeError:
+                # The captured loop already closed (possible under TestClient
+                # teardown). The ring still holds the event for replay, and the
+                # publishing worker thread must never die over fan-out.
+                pass
 
     # -- subscribe (called from the SSE async generator) ----------------
-    def subscribe(self, book_id: str) -> "tuple[asyncio.Queue[Dict[str, Any]], List[Dict[str, Any]], bool]":
+    def subscribe(self, book_id: str) -> "tuple[asyncio.Queue[SeqEvent], List[SeqEvent], bool]":
         """Register a subscriber.
 
-        Returns (queue, replay_events, already_finished). The caller should emit
-        every event in ``replay_events`` first, then drain the queue for live
-        events. If ``already_finished`` is True and the replay already contains a
-        terminal event, the caller can close after replay.
+        Returns (queue, replay_events, already_finished); events are
+        ``(seq, event)`` pairs. The caller should emit every event in
+        ``replay_events`` first, then drain the queue for live events. If
+        ``already_finished`` is True and the replay already contains a terminal
+        event, the caller can close after replay.
         """
         self._ensure_loop()
-        q: "asyncio.Queue[Dict[str, Any]]" = asyncio.Queue()
+        q: "asyncio.Queue[SeqEvent]" = asyncio.Queue()
         with self._lock:
             ch = self._channel(book_id)
             replay = list(ch.ring)
@@ -128,7 +146,7 @@ class EventBroker:
             ch.subscribers.add(q)
         return q, replay, finished
 
-    def unsubscribe(self, book_id: str, q: "asyncio.Queue[Dict[str, Any]]") -> None:
+    def unsubscribe(self, book_id: str, q: "asyncio.Queue[SeqEvent]") -> None:
         with self._lock:
             ch = self._channels.get(book_id)
             if ch is not None:
@@ -155,7 +173,7 @@ class EventBroker:
             del self._channels[book_id]
 
 
-def _safe_put(q: "asyncio.Queue[Dict[str, Any]]", event: Dict[str, Any]) -> None:
+def _safe_put(q: "asyncio.Queue[SeqEvent]", event: SeqEvent) -> None:
     try:
         q.put_nowait(event)
     except Exception:

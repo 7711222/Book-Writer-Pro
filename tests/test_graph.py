@@ -1,7 +1,9 @@
 import unittest
 
 from bookwriter.graph import StoryGraph, StateDelta
-from bookwriter.models import Bible, Character, Location, PlotThread, ChapterPlan, ChapterRecord
+from bookwriter.models import (
+    Bible, Character, Item, Location, PlotThread, ChapterPlan, ChapterRecord,
+)
 
 
 def _bible():
@@ -64,6 +66,45 @@ class TestGraph(unittest.TestCase):
         tail = g.prev_tail(2, words=2)
         self.assertEqual(tail, "four five")
         self.assertEqual(g.prev_tail(1, words=2), "")  # no chapter 0
+
+    def test_from_dict_coerces_off_spec_scalars(self):
+        # The json_object provider path can emit numbers/nulls/lists for the
+        # string scalars; a truthy non-string used to crash record_chapter's
+        # .strip() (outside the pipeline's extract try/except).
+        d = StateDelta.from_dict(1, {"synopsis_line": 42, "timeline_summary": None,
+                                     "time_marker": ["dawn"], "continuity_flags": "oops"})
+        self.assertEqual(d.synopsis_line, "")
+        self.assertEqual(d.timeline_summary, "")
+        self.assertEqual(d.time_marker, "")
+        self.assertEqual(d.continuity_flags, [])
+        # record_chapter survives the coerced line
+        g = StoryGraph(_bible())
+        rec = ChapterRecord(number=1, title="One", text="t")
+        g.record_chapter(rec, d.synopsis_line, settings_cap=240)
+        self.assertEqual(g.synopsis, [""])
+
+    def test_relevant_slice_includes_items(self):
+        b = _bible()
+        b.items.append(Item(id="keepsake", name="The Keepsake",
+                            description="a small thing"))
+        g = StoryGraph(b)
+        sl = g.relevant_slice(b.plan(1))
+        self.assertIn("The Keepsake", sl)
+        self.assertIn("## Items", sl)
+
+    def test_dynamic_state_shows_midbook_discoveries(self):
+        # Entities discovered after planning are absent from the frozen prefix
+        # AND from plan.character_ids (the outline predates the discovery), so
+        # dynamic_state must surface them or the writer never learns they exist.
+        g = StoryGraph(_bible())
+        g.apply_delta(StateDelta.from_dict(3, {
+            "new_characters": [{"id": "drifter", "name": "The Drifter"}],
+            "new_items": [{"id": "coin", "name": "The Coin"}],
+        }))
+        dyn = g.dynamic_state(g.bible.plan(1))   # plan lists only "hero"
+        self.assertIn("The Drifter", dyn)
+        self.assertIn("The Coin", dyn)
+        self.assertIn("Items discovered mid-book", dyn)
 
 
 if __name__ == "__main__":

@@ -17,6 +17,7 @@ import json
 from typing import Any, Callable, Dict, Optional
 
 from .costs import CostLedger, Usage
+from .llm import TruncatedOutputError
 from .provider import resolve_model, target_model
 
 
@@ -49,6 +50,10 @@ class OpenAICompatLLM:
     ):
         self.provider = provider
         self.model_override = model_override
+        # Why the last response stopped, normalized to Anthropic vocabulary
+        # ("length" -> "max_tokens") so the pipeline's truncation check is
+        # provider-agnostic.
+        self.last_stop_reason: Optional[str] = None
         if client is not None:
             self.client = client
             return
@@ -85,6 +90,14 @@ class OpenAICompatLLM:
             response_format={"type": "json_object"},
         )
         self._record(ledger, stage, target, resp.usage, cache_ttl)
+        finish = getattr(resp.choices[0], "finish_reason", None)
+        self.last_stop_reason = "max_tokens" if finish == "length" else finish
+        if finish == "length":
+            # A cut-off JSON payload can never parse — fail with the real cause.
+            raise TruncatedOutputError(
+                f"{stage}: JSON output truncated at max_tokens={max_tokens} "
+                "(finish_reason=length) — raise the stage's max_tokens setting and retry."
+            )
         text = resp.choices[0].message.content or ""
         if not text:
             return {}
@@ -107,11 +120,13 @@ class OpenAICompatLLM:
         )
         parts = []
         usage = None
+        finish = None
         for chunk in stream:
             usage = getattr(chunk, "usage", None) or usage
             choices = getattr(chunk, "choices", None) or []
             if not choices:
                 continue
+            finish = getattr(choices[0], "finish_reason", None) or finish
             delta = getattr(choices[0], "delta", None)
             piece = getattr(delta, "content", None) if delta else None
             if piece:
@@ -120,6 +135,9 @@ class OpenAICompatLLM:
                     on_delta(piece)
         text = "".join(parts)
         self._record(ledger, stage, target, usage, cache_ttl, fallback_out=len(text) // 4)
+        # Don't raise for prose (the text up to the cut is still valuable); the
+        # pipeline reads last_stop_reason and flags the chapter as truncated.
+        self.last_stop_reason = "max_tokens" if finish == "length" else finish
         return text
 
     # ------------------------------------------------------------------

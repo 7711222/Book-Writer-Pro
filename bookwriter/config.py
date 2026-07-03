@@ -51,6 +51,17 @@ EFFORT_CAPABLE = {
     "claude-fable-5",
 }
 
+# Models that support adaptive thinking ({"type": "adaptive"}): the 4.6+ line and
+# Fable. Older models (e.g. Haiku 4.5) only speak the legacy enabled/budget_tokens
+# form, so when one of them is the EFFECTIVE model (per-book override) the
+# adaptive param must be omitted entirely instead of sent (see llm._thinking_param).
+ADAPTIVE_CAPABLE = {
+    "claude-opus-4-8",
+    "claude-opus-4-7",
+    "claude-sonnet-4-6",
+    "claude-fable-5",
+}
+
 
 @dataclass(frozen=True)
 class StageModel:

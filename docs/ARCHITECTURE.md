@@ -9,12 +9,15 @@ server, and the no-build frontend.
 The layering rule that governs the whole codebase:
 
 > The **core package** (`bookwriter/*` outside `server/`) imports only the
-> standard library and, lazily, `anthropic`. It must import on a bare Python
-> 3.10+ with no third-party installs. `fastapi`, `uvicorn`, `httpx`, and `mcp`
-> are imported **only inside `bookwriter/server/`** — never from
-> `bookwriter/__init__.py` or any core module. This keeps the engine embeddable
-> and its test suite installable-free, and makes the server/MCP surfaces
-> strictly additive.
+> standard library and, lazily, the optional SDKs of the backend actually in
+> use (`anthropic`, `openai`, `reportlab`). It must import on a bare Python
+> 3.10+ with no third-party installs. `fastapi` is imported **only inside
+> `bookwriter/server/`**, `uvicorn` only lazily inside the `serve.py` entry
+> point, and `mcp` only lazily inside `mcp_server.py` — never from
+> `bookwriter/__init__.py` or any core module. (`httpx` is a test-only
+> dependency shipped with the `[server]` extra; nothing in the package itself
+> imports it.) This keeps the engine embeddable and its test suite
+> installable-free, and makes the server/MCP surfaces strictly additive.
 
 ---
 
@@ -65,9 +68,13 @@ The layering rule that governs the whole codebase:
         └──────────────────────────────────────────────────────────────────┘
 
         ┌──────────────────────────────────────────────────────────────────┐
-        │  LLM seam (llm.py)                                                 │
-        │    AnthropicLLM(api_key)  — live, lazy-imports `anthropic`         │
-        │    MockLLM()  (mock.py)   — offline, no key, simulated tokens      │
+        │  LLM seam — provider.make_llm() selects the backend                │
+        │    AnthropicLLM   (llm.py)         Anthropic API, lazy `anthropic` │
+        │    OpenAICompatLLM (llm_openai.py) openai · openrouter · grok(xAI) │
+        │    ClaudeCliLLM / GenericCliLLM    claude-cli · codex · grok-cli · │
+        │      (llm_claude_cli.py, llm_cli.py)  cli — subscription CLIs      │
+        │    MockLLM        (mock.py)        offline, no key, simulated      │
+        │                                    tokens — demo mode + tests      │
         └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -85,6 +92,12 @@ the raw material.
 |---|---|
 | `config.py` | `Settings`, `QUALITY_PROFILES` (`premium`/`balanced`/`draft`), `DEFAULT_PROFILE="balanced"`, `MODEL_PRICES`, per-stage `StageModel(model, effort, thinking)`. The cost/quality dial lives here. |
 | `llm.py` | `LLM` protocol; `AnthropicLLM` (lazy-imports `anthropic`). |
+| `llm_openai.py` | `OpenAICompatLLM` — the same `LLM` protocol against any OpenAI-style Chat Completions endpoint; backs the `openai`, `openrouter`, and `grok` (xAI) providers (lazy-imports `openai`). |
+| `llm_claude_cli.py` | `ClaudeCliLLM` — shells out to a signed-in `claude -p` (Claude Code), so a Claude subscription generates with no API key. |
+| `llm_cli.py` | `GenericCliLLM` — vendor-agnostic subprocess backend behind the `codex`, `grok-cli`, and custom `cli` providers. |
+| `provider.py` | The backend switchboard: canonical provider ids + aliases, strong/mid/cheap tier mapping to per-provider model ids, the `make_llm()` factory, and the `live_available()` credential gate. |
+| `runtime_config.py` | Persisted setting/credential overlay on top of `os.environ` (`rc.getenv`) — the backing store for the in-app Settings panel. |
+| `prompts.py` | System prompts and strict JSON schemas for the structured pipeline stages. |
 | `mock.py` | `MockLLM` — offline, deterministic, simulated tokens and placeholder prose. Powers demo mode and the test suite. |
 | `planner.py` | Turns a premise into a `Bible` (characters, locations, items, threads, chapter `outline`). |
 | `writer.py` | Writes one chapter from a pre-resolved context slice; streams prose deltas. |
@@ -95,6 +108,12 @@ the raw material.
 | `costs.py` | `CostLedger` — per-call token + dollar accounting, cache-savings, `$/1k words`. |
 | `store.py` | `BookStore(project_dir)`: load/save graph & bible, `has_chapter(n)`, `assemble_manuscript`, `chapter_md(n)`, `book_path`. |
 | `pipeline.py` | `BookPipeline` orchestrator — `.plan()`, `.load()`, `.write_all()`, exposes `.graph` and `.ledger`, emits `on_event` dicts. |
+| `images.py` | Pluggable chapter-illustration providers (`pixio` default · `openai` · generic `http`), selected by `BOOKWRITER_IMAGE_PROVIDER`. Best-effort: a failed image never blocks prose. |
+| `importer.py` | Turns an existing `.txt`/`.md` manuscript into a first-class book: chapter split plus a reverse-engineered bible/continuity graph. |
+| `kdp.py` | Amazon KDP packaging: stdlib EPUB builder, AI listing metadata (description, keywords, categories, …), marketing copy, checklist. |
+| `print_export.py` | Paperback artifacts, pure stdlib: `.docx` interior, print spec (page count, spine width, wrap dimensions), print-cover SVG. |
+| `royalties.py` | Deterministic KDP royalty estimator — eBook 35%/70% plans (delivery fee included) and paperback (printing cost included). |
+| `pdf.py` | PDF exports (interior / front cover / back cover / full book) via the optional `[pdf]` extra (reportlab); raises `PdfUnavailable` with an install hint otherwise. |
 | `cli.py` / `__main__.py` | `bookwriter` CLI (`profiles`, `plan`, `write`, `generate`, `report`, `import`, `revise`, `continue`, `kdp`, `price`, `cover`, `pdf`). |
 
 ### `BookPipeline` surface
@@ -159,7 +178,8 @@ in `config.py`):
 API under `/api`. CORS is enabled for localhost.
 
 **Data root.** Books live under a data directory — default
-`C:\Users\VR\projects\BookwritterPro/.bookwriter_data`, overridable via the
+`<repo>/.bookwriter_data` in a source checkout, `~/.bookwriter_data` for a
+pip-installed wheel, overridable via the
 `BOOKWRITER_DATA_DIR` env var. Each book is `<data>/<id>/` (the `BookStore`
 `project_dir`) plus a `meta.json` `{id,title,created_at,profile,mock,genre,logline}`.
 The **book id** is `slug(title) + "-" + 6-char hash`.

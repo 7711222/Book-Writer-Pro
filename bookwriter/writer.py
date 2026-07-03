@@ -84,6 +84,15 @@ def write_chapter(
         cache_ttl=settings.cache_ttl,
         on_delta=on_delta,
     ).strip()
+    if not text:
+        # A refusal or a thinking-consumed output budget yields empty prose.
+        # Saving it would permanently mark the chapter written (the resume check
+        # is file-existence only) — a silent hole in the manuscript. Fail loudly.
+        raise ValueError(
+            f"model returned no prose for chapter {plan.number} — likely a "
+            "refusal or an exhausted output budget; retry or raise "
+            "Settings.max_tokens_write"
+        )
 
     rec = ChapterRecord(number=plan.number, title=plan.title, text=text)
     rec.word_count = _word_count(text)
@@ -139,6 +148,14 @@ def revise_chapter(
         cache_ttl=settings.cache_ttl,
         on_delta=on_delta,
     ).strip()
+    if not text:
+        # Same guard as write_chapter: never let an empty revision silently
+        # replace real prose.
+        raise ValueError(
+            f"model returned no prose for the revision of chapter {plan.number} "
+            "— likely a refusal or an exhausted output budget; retry or raise "
+            "Settings.max_tokens_write"
+        )
 
     rec = ChapterRecord(number=plan.number, title=plan.title, text=text)
     rec.word_count = _word_count(text)

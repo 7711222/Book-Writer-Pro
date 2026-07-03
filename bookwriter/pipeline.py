@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Callable, Dict, List, Optional
 
 from .config import Settings
@@ -99,6 +100,13 @@ class BookPipeline:
             title=title, genre=genre, extra_guidance=extra_guidance,
         )
         self.graph = StoryGraph(bible)
+        if os.path.exists(self.store.book_path):
+            # Re-planning an existing project: purge the previous outline's
+            # chapter artifacts BEFORE saving the new plan — load_graph reloads
+            # any chapters/NN.json whose number matches the new outline, and the
+            # resume branch would then silently stitch the old book's prose into
+            # the new manuscript. Fresh dirs have no book.json and are untouched.
+            self.store.clear_chapters()
         self.store.save_graph(self.graph)
         self.progress(f"Planned '{bible.title}': {len(bible.outline)} chapters, "
                       f"{len(bible.characters)} characters.")
@@ -116,6 +124,28 @@ class BookPipeline:
         return True
 
     # ------------------------------------------------------------------
+    def _repair_missing_delta(self, plan, number: int) -> None:
+        """Backfill the continuity delta for a written chapter whose rolling-
+        synopsis slot is missing/empty (a crash during extract/check persisted
+        the prose but not the graph update). Best-effort, mirroring the same
+        degradation policy as the inline extract stage."""
+        assert self.graph is not None
+        slot = self.graph.synopsis[number - 1] if number <= len(self.graph.synopsis) else ""
+        if isinstance(slot, str) and slot.strip():
+            return
+        rec = self.graph.chapters[number]
+        self.progress(f"Chapter {number}: repairing missing continuity state...")
+        try:
+            delta = extract_delta(self.llm, self.settings, self.ledger, self.graph, plan, rec)
+            self.graph.apply_delta(delta)
+            self.graph.record_chapter(rec, delta.synopsis_line, self.settings.synopsis_line_chars)
+            self.store.save_chapter(rec)
+            self.store.save_graph(self.graph)
+        except Exception as e:  # noqa: BLE001 - repair is best-effort, like extract itself
+            logger.exception("continuity repair failed for chapter %s", number)
+            self.progress(f"  [!] continuity repair failed: {e} (chapter kept, continuing)")
+
+    # ------------------------------------------------------------------
     def write_all(self, *, resume: bool = True, only: Optional[List[int]] = None) -> CostLedger:
         if self.graph is None and not self.load():
             raise RuntimeError("No plan found. Run plan() first.")
@@ -128,6 +158,12 @@ class BookPipeline:
                 continue
             if resume and not only and self.store.has_chapter(number) \
                     and number in self.graph.chapters:
+                # A crash between saving the prose and saving the graph (the
+                # extract/check window) leaves the chapter written but its
+                # continuity delta lost — an empty rolling-synopsis slot that
+                # every later chapter would be written against. Repair it by
+                # re-running the cheap extract stage before skipping.
+                self._repair_missing_delta(plan, number)
                 self.progress(f"Chapter {number}: already written - skipping.")
                 continue
 
@@ -139,6 +175,10 @@ class BookPipeline:
                 delta_cb = lambda t, n=number: self._emit(type="delta", number=n, text=t)
             rec = write_chapter(self.llm, self.settings, self.ledger, self.graph, plan,
                                 on_delta=delta_cb)
+            # Capture the writer's stop reason NOW — the extract/check calls
+            # below reuse the same client and would overwrite it. Backends that
+            # don't track it (subscription CLIs) simply never flag truncation.
+            truncated = getattr(self.llm, "last_stop_reason", None) == "max_tokens"
             # Persist the expensive prose IMMEDIATELY, before the cheap extract/
             # check stages run. A malformed-JSON failure in those mechanical
             # stages must never discard a chapter we already generated and paid
@@ -147,12 +187,15 @@ class BookPipeline:
             self.progress(f"Chapter {number}: {rec.word_count} words. Extracting state...")
 
             flags: List[str] = []
+            if truncated:
+                flags.append("[high] chapter truncated at max_tokens — raise "
+                             "Settings.max_tokens_write or lower the chapter word target")
             synopsis = ""
             try:
                 delta = extract_delta(self.llm, self.settings, self.ledger, self.graph, plan, rec)
                 self.graph.apply_delta(delta)
                 synopsis = delta.synopsis_line
-                flags = list(delta.continuity_flags)
+                flags += list(delta.continuity_flags)
                 if self.settings.run_continuity_check:
                     issues = check_chapter(self.llm, self.settings, self.ledger, self.graph, plan, rec)
                     flags += [f"[{i.get('severity', '?')}] {i.get('description', '')}" for i in issues]
@@ -170,6 +213,11 @@ class BookPipeline:
             # resumed run skips it, then persist graph + a cost snapshot per
             # chapter (so an interrupted run keeps accurate cost accounting).
             self.graph.record_chapter(rec, synopsis, self.settings.synopsis_line_chars)
+            # record_chapter just computed the fingerprint and set the capped
+            # synopsis line on the record — re-save (atomic, cheap) so
+            # chapters/NN.json carries them; the API/MCP layers read both
+            # straight from disk after a process restart.
+            self.store.save_chapter(rec)
             self.store.save_graph(self.graph)
             self.store.save_cost(self.ledger.report(), _ledger_dict(self.ledger))
 

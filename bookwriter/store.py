@@ -137,6 +137,24 @@ class BookStore:
     def has_chapter(self, n: int) -> bool:
         return os.path.exists(self.chapter_json(n))
 
+    def clear_chapters(self) -> None:
+        """Delete every generated chapter artifact: chapters/*.json + *.md,
+        chapter images, manuscript.md and the cost snapshot. Called when a
+        project is RE-planned, so load_graph/resume can never stitch a previous
+        book's prose into the new outline (book.json/state.json themselves are
+        overwritten by the subsequent save_graph)."""
+        if os.path.isdir(self.chapters_dir):
+            for name in os.listdir(self.chapters_dir):
+                if name.endswith((".json", ".md")):
+                    _unlink_quiet(os.path.join(self.chapters_dir, name))
+        if os.path.isdir(self.images_dir):
+            for name in os.listdir(self.images_dir):
+                stem, _, ext = name.rpartition(".")
+                if ext.lower() in self._IMG_EXTS and stem.isdigit():
+                    _unlink_quiet(os.path.join(self.images_dir, name))
+        for name in ("manuscript.md", "cost.json", "cost.txt"):
+            _unlink_quiet(os.path.join(self.dir, name))
+
     # ---- assembly -----------------------------------------------------
     def assemble_manuscript(self, graph: StoryGraph) -> str:
         b = graph.bible
@@ -156,6 +174,14 @@ class BookStore:
     def save_cost(self, report: str, data: dict):
         _write_json(os.path.join(self.dir, "cost.json"), data)
         _write_text(os.path.join(self.dir, "cost.txt"), report)
+
+
+def _unlink_quiet(path: str) -> None:
+    """Best-effort delete (missing file / transient Windows lock is fine)."""
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
 
 
 def _atomic_replace(tmp: str, path: str) -> None:

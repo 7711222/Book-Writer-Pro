@@ -10,7 +10,8 @@ does three things:
      hard limits in Python so a chatty model can't produce an invalid listing.
   2. Build a valid, stdlib-only EPUB 3 from the chapters (no third-party deps:
      just ``zipfile`` + manual, escaped XML). Chapter prose is never dropped.
-  3. Write a copy-paste kit (metadata.json, manuscript.epub, cover.svg,
+  3. Write a copy-paste kit (metadata.json, manuscript.epub, cover.svg — plus a
+     raster cover.<ext> when AI art exists, since KDP rejects SVG uploads —
      kdp-listing.txt, CHECKLIST.md) the author pastes field-by-field into KDP.
 
 User-set identity fields (author name, publishing rights, explicit-content flag)
@@ -24,6 +25,7 @@ import json
 import os
 import zipfile
 from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from xml.sax.saxutils import escape as _xml_escape, quoteattr as _xml_quoteattr
 
@@ -522,9 +524,25 @@ def generate_marketing(llm, settings, ledger, graph, meta: "KdpMetadata") -> Dic
 # ---------------------------------------------------------------------------
 # 4. EPUB 3 builder (pure stdlib)
 # ---------------------------------------------------------------------------
+# XML 1.0 forbids most C0 control characters; a pasted \x0b or \x0c (Word soft
+# breaks) would make every consumer reject the file. Translate them away before
+# escaping: \x0b/\x0c become spaces, the rest (except \t \n \r) are dropped,
+# as are the ￾/￿ noncharacters (also outside XML 1.0's Char range).
+_XML_CTRL_TRANSLATE = str.maketrans({
+    **{c: None for c in range(0x20) if c not in (0x09, 0x0A, 0x0D)},
+    0x0B: " ", 0x0C: " ", 0x7F: None, 0xFFFE: None, 0xFFFF: None,
+})
+
+
 def _esc(text: str) -> str:
-    """XML-escape text for element content / attribute-safe usage."""
-    return _xml_escape(str(text if text is not None else ""))
+    """XML-escape text for element content / attribute-safe usage.
+
+    Also strips XML-1.0-illegal control characters so pasted/imported prose
+    (e.g. Word's \\x0b soft line breaks) can't corrupt the EPUB/DOCX.
+    """
+    return _xml_escape(
+        str(text if text is not None else "").translate(_XML_CTRL_TRANSLATE)
+    )
 
 
 def _paragraphs(text: str) -> List[str]:
@@ -715,12 +733,41 @@ def back_cover_svg(graph, meta: "KdpMetadata", *, art_bytes: Optional[bytes] = N
     )
 
 
-def _xhtml(title: str, body: str) -> str:
+# KDP-supported language names -> BCP-47 codes for dc:language / xml:lang.
+# Kindle uses the OPF language for dictionary/typography/store classification,
+# so a non-English book must not ship tagged as 'en'.
+_LANGUAGE_CODES = {
+    "english": "en", "spanish": "es", "german": "de", "french": "fr",
+    "italian": "it", "portuguese": "pt", "dutch": "nl", "japanese": "ja",
+    "hindi": "hi", "afrikaans": "af", "arabic": "ar", "basque": "eu",
+    "catalan": "ca", "chinese": "zh", "danish": "da", "finnish": "fi",
+    "galician": "gl", "gujarati": "gu", "icelandic": "is", "irish": "ga",
+    "malayalam": "ml", "marathi": "mr", "norwegian": "no", "polish": "pl",
+    "romanian": "ro", "swedish": "sv", "tamil": "ta", "welsh": "cy",
+}
+
+
+def _lang_code(language: str) -> str:
+    """Map a KDP language NAME (e.g. 'Spanish') to a BCP-47 code ('es').
+
+    A value that already looks like a bare 2-3 letter code is passed through
+    lowercased; anything unrecognized falls back to 'en'.
+    """
+    name = (language or "English").strip().lower()
+    if name in _LANGUAGE_CODES:
+        return _LANGUAGE_CODES[name]
+    if 2 <= len(name) <= 3 and name.isalpha():
+        return name
+    return "en"
+
+
+def _xhtml(title: str, body: str, lang: str = "en") -> str:
+    lang = _esc(lang or "en")
     return (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<!DOCTYPE html>\n'
         '<html xmlns="http://www.w3.org/1999/xhtml" '
-        'xmlns:epub="http://www.idpf.org/2007/ops" lang="en" xml:lang="en">\n'
+        f'xmlns:epub="http://www.idpf.org/2007/ops" lang="{lang}" xml:lang="{lang}">\n'
         f'<head><meta charset="utf-8"/><title>{_esc(title)}</title>'
         '<link rel="stylesheet" type="text/css" href="style.css"/></head>\n'
         f'<body>\n{body}\n</body>\n</html>\n'
@@ -743,7 +790,9 @@ _IMG_MEDIA = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
 
 
 def build_epub(graph, meta: "KdpMetadata", *, cover_svg: Optional[str] = None,
-               images: Optional[Dict[int, "tuple"]] = None) -> bytes:
+               images: Optional[Dict[int, "tuple"]] = None,
+               art_bytes: Optional[bytes] = None, art_ext: str = "png",
+               modified: Optional[str] = None) -> bytes:
     """Build a valid EPUB 3 (returned as zip bytes). Stdlib only.
 
     Layout:
@@ -753,17 +802,28 @@ def build_epub(graph, meta: "KdpMetadata", *, cover_svg: Optional[str] = None,
       OEBPS/nav.xhtml                      EPUB3 nav (chapter TOC)
       OEBPS/toc.ncx                        NCX for back-compat
       OEBPS/style.css
+      OEBPS/cover.jpg|png + cover.xhtml    raster cover when art is supplied, or
       OEBPS/cover.svg + cover.xhtml        SVG cover (given or generated)
       OEBPS/title.xhtml                    title page
       OEBPS/chap-NN.xhtml                  one per chapter (escaped, <p> split)
 
-    Chapter prose is never dropped.
+    When ``art_bytes`` is given, the cover artwork is embedded directly as the
+    ``cover-image`` raster (smaller file — no base64 inflation, lower delivery
+    fee); the SVG cover is used only when there is no art. ``modified``
+    overrides the dcterms:modified timestamp (defaults to the build time) so
+    tests stay deterministic. Chapter prose is never dropped.
     """
     import io
 
     b = graph.bible
     cover = cover_svg if cover_svg else _fallback_cover_svg(meta)
     book_id = _book_id(graph, meta)
+    lang_code = _lang_code(meta.language)
+    if not modified:
+        modified = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    art_ext = (art_ext or "png").lower().lstrip(".")
+    if art_ext not in _IMG_MEDIA:
+        art_ext = "png"
 
     chapters = [graph.chapters[n] for n in sorted(graph.chapters)]
     images = images or {}
@@ -801,7 +861,7 @@ def build_epub(graph, meta: "KdpMetadata", *, cover_svg: Optional[str] = None,
             "file": fname,
             "title": rec.title,
             "number": rec.number,
-            "xhtml": _xhtml(rec.title, body),
+            "xhtml": _xhtml(rec.title, body, lang_code),
         })
 
     # --- title page ---------------------------------------------------------
@@ -813,15 +873,18 @@ def build_epub(graph, meta: "KdpMetadata", *, cover_svg: Optional[str] = None,
     )
     for extra in meta.contributor_names():
         title_body_parts.append(f'<p class="title-author">{_esc(extra)}</p>')
-    title_xhtml = _xhtml(meta.title, "\n".join(title_body_parts))
+    title_xhtml = _xhtml(meta.title, "\n".join(title_body_parts), lang_code)
 
     # --- cover page ---------------------------------------------------------
+    # With art the cover-image is the raster itself (KDP-friendly, no base64
+    # inflation); the SVG cover is the no-art typographic fallback.
+    cover_file = f"cover.{art_ext}" if art_bytes else "cover.svg"
     cover_body = (
         '<section epub:type="cover" class="cover">\n'
-        '<img src="cover.svg" alt="Cover"/>\n'
+        f'<img src="{cover_file}" alt="Cover"/>\n'
         '</section>'
     )
-    cover_xhtml = _xhtml("Cover", cover_body)
+    cover_xhtml = _xhtml("Cover", cover_body, lang_code)
 
     # --- nav.xhtml ----------------------------------------------------------
     nav_items = "\n".join(
@@ -837,7 +900,7 @@ def build_epub(graph, meta: "KdpMetadata", *, cover_svg: Optional[str] = None,
         '  </ol>\n'
         '</nav>'
     )
-    nav_xhtml = _xhtml("Table of Contents", nav_body)
+    nav_xhtml = _xhtml("Table of Contents", nav_body, lang_code)
 
     # --- toc.ncx ------------------------------------------------------------
     nav_points = []
@@ -870,14 +933,31 @@ def build_epub(graph, meta: "KdpMetadata", *, cover_svg: Optional[str] = None,
         creators.append(
             f'    <dc:creator id="{cid}">{_esc(name)}</dc:creator>'
         )
-    lang_code = "en" if (meta.language or "English").lower().startswith("en") else "en"
+
+    if art_bytes:
+        cover_image_item = (
+            f'    <item id="cover-image" href="{cover_file}" '
+            f'media-type="{_IMG_MEDIA[art_ext]}" properties="cover-image"/>'
+        )
+        cover_page_item = (
+            '    <item id="cover" href="cover.xhtml" media-type="application/xhtml+xml"/>'
+        )
+    else:
+        cover_image_item = (
+            '    <item id="cover-image" href="cover.svg" '
+            'media-type="image/svg+xml" properties="cover-image"/>'
+        )
+        cover_page_item = (
+            '    <item id="cover" href="cover.xhtml" '
+            'media-type="application/xhtml+xml" properties="svg"/>'
+        )
 
     manifest_items = [
         '    <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>',
         '    <item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>',
         '    <item id="css" href="style.css" media-type="text/css"/>',
-        '    <item id="cover-image" href="cover.svg" media-type="image/svg+xml" properties="cover-image"/>',
-        '    <item id="cover" href="cover.xhtml" media-type="application/xhtml+xml" properties="svg"/>',
+        cover_image_item,
+        cover_page_item,
         '    <item id="title" href="title.xhtml" media-type="application/xhtml+xml"/>',
     ]
     for cf in chapter_files:
@@ -896,14 +976,14 @@ def build_epub(graph, meta: "KdpMetadata", *, cover_svg: Optional[str] = None,
     opf = (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<package xmlns="http://www.idpf.org/2007/opf" version="3.0" '
-        'unique-identifier="book-id" xml:lang="en">\n'
+        f'unique-identifier="book-id" xml:lang="{_esc(lang_code)}">\n'
         '  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/" '
         'xmlns:opf="http://www.idpf.org/2007/opf">\n'
         f'    <dc:identifier id="book-id">{_esc(book_id)}</dc:identifier>\n'
         f'    <dc:title>{_esc(meta.full_title())}</dc:title>\n'
         + "\n".join(creators) + "\n"
         f'    <dc:language>{_esc(lang_code)}</dc:language>\n'
-        f'    <meta property="dcterms:modified">2026-01-01T00:00:00Z</meta>\n'
+        f'    <meta property="dcterms:modified">{_esc(modified)}</meta>\n'
         '    <meta name="cover" content="cover-image"/>\n'
         '  </metadata>\n'
         '  <manifest>\n' + "\n".join(manifest_items) + '\n  </manifest>\n'
@@ -938,7 +1018,10 @@ def build_epub(graph, meta: "KdpMetadata", *, cover_svg: Optional[str] = None,
         add("OEBPS/nav.xhtml", nav_xhtml)
         add("OEBPS/toc.ncx", toc_ncx)
         add("OEBPS/style.css", _CSS)
-        add("OEBPS/cover.svg", cover)
+        if art_bytes:
+            zf.writestr(f"OEBPS/{cover_file}", art_bytes, zipfile.ZIP_DEFLATED)
+        else:
+            add("OEBPS/cover.svg", cover)
         add("OEBPS/cover.xhtml", cover_xhtml)
         add("OEBPS/title.xhtml", title_xhtml)
         for cf in chapter_files:
@@ -1011,7 +1094,7 @@ def _listing_text(meta: "KdpMetadata") -> str:
     return "\n".join(L)
 
 
-def _checklist_md(meta: "KdpMetadata") -> str:
+def _checklist_md(meta: "KdpMetadata", *, cover_image: str = "") -> str:
     used = len(meta.keywords)
     free_slots = MAX_KEYWORDS - used
     storyteller_tip = (
@@ -1021,6 +1104,27 @@ def _checklist_md(meta: "KdpMetadata") -> str:
         f"All 7 keyword slots are used. To enter the Kindle Storyteller UK 2026 "
         f"contest, swap one for `{STORYTELLER_KEYWORD}`."
     )
+    # KDP does NOT accept SVG covers (eBook covers must be JPEG/TIFF), so point
+    # the author at the raster when the kit has one.
+    if cover_image:
+        is_jpeg = cover_image.lower().endswith((".jpg", ".jpeg"))
+        cover_step = (
+            f"**Cover** — upload `{cover_image}`"
+            + ("" if is_jpeg else
+               " (convert it to a JPG first — KDP eBook covers must be JPEG or TIFF)")
+            + ". KDP does NOT accept SVG."
+        )
+        cover_files = (
+            f"- `{cover_image}` — the raster cover to upload\n"
+            "- `cover.svg` — editable cover source (KDP does not accept SVG uploads)"
+        )
+    else:
+        cover_step = (
+            "**Cover** — KDP does NOT accept SVG: export `cover.svg` to a "
+            "high-res JPG (the web UI's cover export, or any SVG converter) "
+            "and upload that"
+        )
+        cover_files = "- `cover.svg` — editable cover source (convert to JPG before uploading)"
     return f"""# KDP Upload Checklist — {meta.full_title()}
 
 This kit was generated for Amazon Kindle Direct Publishing (KDP). Work through it
@@ -1046,7 +1150,7 @@ Paste from `kdp-listing.txt`, field by field:
 
 ## Page 2 — Kindle eBook Content
 - [ ] **Manuscript** — upload `manuscript.epub`
-- [ ] **Cover** — upload `cover.svg` (or convert to a JPG/PNG/PDF if KDP rejects SVG)
+- [ ] {cover_step}
 - [ ] **ISBN** — not required for Kindle eBooks. KDP can assign a **free ISBN**, or you may leave it blank.
 - [ ] Use the **Kindle Previewer** to confirm the EPUB renders correctly.
 
@@ -1062,16 +1166,35 @@ Paste from `kdp-listing.txt`, field by field:
 Files in this kit:
 - `metadata.json` — machine-readable copy of every field
 - `manuscript.epub` — the upload-ready ebook
-- `cover.svg` — the cover image
+{cover_files}
 - `kdp-listing.txt` — copy-paste block of all page-1 fields
 """
+
+
+def _find_cover_art(out_dir: str):
+    """Load AI cover art saved next to the kit (cover-art.<ext>), if any."""
+    if not os.path.isdir(out_dir):
+        return None, None
+    for name in sorted(os.listdir(out_dir)):
+        if name.startswith("cover-art."):
+            ext = name.rsplit(".", 1)[-1].lower()
+            if ext not in _IMG_MEDIA:
+                continue  # unsupported extension; keep looking
+            try:
+                with open(os.path.join(out_dir, name), "rb") as f:
+                    return f.read(), ext
+            except OSError:
+                continue
+    return None, None
 
 
 def build_kdp_kit(graph, meta: "KdpMetadata", out_dir: str, *,
                   cover_svg: Optional[str] = None,
                   trim=(6.0, 9.0), paper: str = "white",
                   marketing: Optional[Dict[str, Any]] = None,
-                  images: Optional[Dict[int, "tuple"]] = None) -> Dict[str, Any]:
+                  images: Optional[Dict[int, "tuple"]] = None,
+                  art_bytes: Optional[bytes] = None,
+                  art_ext: str = "png") -> Dict[str, Any]:
     """Write the full KDP kit to ``out_dir`` and return the paths + metadata.
 
     Produces the ebook kit (metadata.json, manuscript.epub, cover.svg,
@@ -1079,6 +1202,11 @@ def build_kdp_kit(graph, meta: "KdpMetadata", out_dir: str, *,
     (interior.docx, print-spec.json, print-cover.svg) and, when a pre-generated
     ``marketing`` dict is supplied, marketing.json. The cover embedded in the EPUB
     and written to cover.svg is the one you pass (or a generated fallback).
+
+    When cover ART is available — passed via ``art_bytes``/``art_ext`` or found
+    on disk as ``out_dir/cover-art.<ext>`` (where generate-cover saves it) — a
+    raster ``cover.<ext>`` is written to the kit (KDP does not accept SVG
+    uploads) and embedded directly in the EPUB as the cover-image.
 
     ``marketing`` is accepted as data (not generated here) so this stays usable in
     pure-export contexts with no LLM/ledger. New kwargs are optional — existing
@@ -1091,6 +1219,13 @@ def build_kdp_kit(graph, meta: "KdpMetadata", out_dir: str, *,
     print_dir = os.path.join(out_dir, "print")
     os.makedirs(print_dir, exist_ok=True)
     cover = cover_svg if cover_svg else _fallback_cover_svg(meta)
+    if art_bytes is None:
+        art_bytes, found_ext = _find_cover_art(out_dir)
+        if art_bytes is not None:
+            art_ext = found_ext
+    art_ext = (art_ext or "png").lower().lstrip(".")
+    if art_ext not in _IMG_MEDIA:
+        art_ext = "png"
 
     paths = {
         "metadata": os.path.join(out_dir, "metadata.json"),
@@ -1102,18 +1237,26 @@ def build_kdp_kit(graph, meta: "KdpMetadata", out_dir: str, *,
         "print_spec": os.path.join(print_dir, "print-spec.json"),
         "print_cover": os.path.join(print_dir, "print-cover.svg"),
     }
+    cover_image_name = ""
+    if art_bytes:
+        cover_image_name = f"cover.{art_ext}"
+        paths["cover_image"] = os.path.join(out_dir, cover_image_name)
 
     meta_dict = meta.to_dict()
     with open(paths["metadata"], "w", encoding="utf-8") as f:
         json.dump(meta_dict, f, indent=2, ensure_ascii=False)
     with open(paths["epub"], "wb") as f:
-        f.write(build_epub(graph, meta, cover_svg=cover, images=images))
+        f.write(build_epub(graph, meta, cover_svg=cover, images=images,
+                           art_bytes=art_bytes, art_ext=art_ext))
     with open(paths["cover"], "w", encoding="utf-8") as f:
         f.write(cover)
+    if art_bytes:
+        with open(paths["cover_image"], "wb") as f:
+            f.write(art_bytes)
     with open(paths["listing"], "w", encoding="utf-8") as f:
         f.write(_listing_text(meta))
     with open(paths["checklist"], "w", encoding="utf-8") as f:
-        f.write(_checklist_md(meta))
+        f.write(_checklist_md(meta, cover_image=cover_image_name))
 
     # --- print kit ---------------------------------------------------------
     spec = _pe.print_spec(graph, meta, trim=trim, paper=paper)

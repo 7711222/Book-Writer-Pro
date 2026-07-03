@@ -5,7 +5,8 @@ import threading
 import time
 import unittest
 
-from bookwriter.store import _read_json, _write_json
+from bookwriter.models import Bible, ChapterRecord
+from bookwriter.store import BookStore, _read_json, _write_json
 
 
 class TestAtomicWrite(unittest.TestCase):
@@ -66,6 +67,34 @@ class TestAtomicWrite(unittest.TestCase):
         for t in threads:
             t.join(timeout=30)
         self.assertEqual(errors, [], f"atomic write violated: {errors[:5]}")
+
+
+class TestClearChapters(unittest.TestCase):
+    def test_clear_chapters_removes_artifacts_keeps_bible(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = BookStore(tmp)
+            store.save_bible(Bible(title="T"))
+            store.save_chapter(ChapterRecord(number=1, title="a", text="x"))
+            store.save_image(1, b"\x89PNG", "png")
+            store.save_cost("report", {"total_cost": 0})
+            with open(os.path.join(tmp, "manuscript.md"), "w", encoding="utf-8") as f:
+                f.write("# T\n")
+
+            store.clear_chapters()
+
+            self.assertFalse(store.has_chapter(1))
+            self.assertFalse(os.path.exists(store.chapter_md(1)))
+            self.assertIsNone(store.find_image(1))
+            self.assertFalse(os.path.exists(os.path.join(tmp, "manuscript.md")))
+            self.assertFalse(os.path.exists(os.path.join(tmp, "cost.json")))
+            self.assertFalse(os.path.exists(os.path.join(tmp, "cost.txt")))
+            # the bible itself is left for the caller to overwrite
+            self.assertTrue(os.path.exists(store.book_path))
+
+    def test_clear_chapters_on_fresh_dir_is_noop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            BookStore(tmp).clear_chapters()   # nothing to delete, no error
+            self.assertEqual(sorted(os.listdir(tmp)), [])
 
 
 if __name__ == "__main__":

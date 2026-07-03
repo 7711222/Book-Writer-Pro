@@ -17,12 +17,12 @@ ideal for trying the tools before spending tokens.
 | --- | --- |
 | `list_profiles()` | Quality profiles (premium/balanced/draft): which Claude model runs each stage + per-model prices. |
 | `list_books()` | Every book in the shared data dir, with progress. |
-| `create_book(premise, chapters=12, words_per_chapter=2000, title="", genre="", profile="balanced", mock=False)` | Plan a book **synchronously** (bible + characters + chapter outline). Returns the new book `id` and the full planned `bible`. |
-| `import_book(text, title="", genre="", guidance="", analyze=True, mock=False)` | Import pre-written material: split into chapters, reverse-engineer the bible + continuity, record every chapter. Returns the new book `id` + `bible`. |
+| `create_book(premise, chapters=12, words_per_chapter=2000, title="", genre="", guidance="", profile="balanced", provider="", model="", chapter_images=False, mock=False)` | Plan a book **synchronously** (bible + characters + chapter outline). `guidance` adds planning instructions; `provider`/`model` pick a per-book LLM backend; `chapter_images` opts into per-chapter illustrations. Returns the new book `id` and the full planned `bible`. |
+| `import_book(text, title="", genre="", guidance="", profile="balanced", analyze=True, mock=False)` | Import pre-written material: split into chapters, reverse-engineer the bible + continuity, record every chapter. With `analyze=True` but no credentials it degrades to a structure-only import. Returns the new book `id` + `bible`. |
 | `edit_chapter(book_id, number, text, title="", reextract=False)` | Replace a chapter's prose (manual edit; no model). `reextract=True` re-runs continuity over the new text. |
 | `revise_chapter(book_id, number, instructions="")` | AI-revise an existing chapter per instructions (or polish), consistent with the bible. |
 | `add_chapters(book_id, count=3, guidance="")` | Continue the story: propose & append N new outline chapters (then `write_book`). |
-| `write_book(book_id, only=None)` | Write chapters **synchronously**; resumes from the last unwritten chapter. Returns `chapters_written`, `cost`, `flags`. |
+| `write_book(book_id, only=None, restart=False)` | Write chapters **synchronously**; resumes from the last unwritten chapter (`restart=True` re-runs from chapter 1). Returns `chapters_written`, `cost`, `flags`. |
 | `write_chapter(book_id, number)` | Write/rewrite a single chapter (sugar for `write_book(only=[number])`). |
 | `get_status(book_id)` | `{chapters_total, chapters_written}`. |
 | `get_chapter(book_id, number)` | A chapter's prose + metadata + its plan. |
@@ -30,7 +30,7 @@ ideal for trying the tools before spending tokens.
 | `get_cost(book_id)` | Token-cost snapshot + human-readable report for the last write run. |
 | `get_manuscript(book_id)` | The assembled full book as Markdown. |
 | `prepare_kdp(book_id, author_first, author_last, ...)` | Generate KDP listing metadata + build the upload kit (EPUB, cover, listing, checklist) into `<book>/kdp/`. |
-| `export_epub(book_id)` | Path to the KDP-ready EPUB (builds the kit if needed). |
+| `export_epub(book_id)` | Path to the KDP-ready EPUB (builds it on demand when `prepare_kdp` hasn't run; the book must be written). |
 | `export_docx(book_id)` | Path to the print-ready 6×9 DOCX interior. |
 | `print_spec(book_id, paper="white")` | Paperback print spec: estimated page count, spine width, full-wrap cover dimensions. |
 | `estimate_royalties(book_id, list_price, marketplace="US", paper="white")` | Estimated eBook + paperback royalties per sale. |
@@ -48,18 +48,20 @@ A typical agent flow:
 
 ## Requirements
 
-- Python 3.13 (the project's interpreter).
+- Python 3.10+ (same as the rest of the project).
 - The `mcp` package: `pip install mcp`. (The module imports `mcp` lazily, so it
   still imports without it; `python -m bookwriter.mcp_server` will print an
   install hint and exit if `mcp` is missing.)
-- For **live** generation (not `mock`): set `ANTHROPIC_API_KEY` and
-  `pip install anthropic`. Mock mode needs neither.
+- For **live** generation (not `mock`): credentials for whichever
+  `BOOKWRITER_LLM_PROVIDER` you use — e.g. `ANTHROPIC_API_KEY`,
+  `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `GROK_API_KEY`, or a signed-in CLI
+  (see `.env.example`). `mock=True` needs none.
 
 ## Run it (stdio)
 
 ```bash
-# from the project root: C:\Users\VR\projects\BookwritterPro
-python -m bookwriter.mcp_server
+# from the project root (your BookwritterPro checkout)
+python -m bookwriter.mcp_server        # use python3 on macOS/Linux if needed
 ```
 
 The server communicates over stdin/stdout — there is no banner; an MCP client
@@ -68,11 +70,11 @@ exit (Ctrl-C to stop), or wire it into a client using the config below.
 
 ### Data directory (shared with the web app)
 
-Books live under `<DATA>/<book_id>/`. The default is
-`C:\Users\VR\projects\BookwritterPro\.bookwriter_data`. Override it with the
-`BOOKWRITER_DATA_DIR` environment variable. **Point the MCP server and the HTTP
-server at the same `BOOKWRITER_DATA_DIR`** (or leave both at the default) so
-they share state.
+Books live under `<DATA>/<book_id>/`. The default is `.bookwriter_data` inside
+the project root for a source checkout (`~/.bookwriter_data` for a pip-installed
+package). Override it with the `BOOKWRITER_DATA_DIR` environment variable.
+**Point the MCP server and the HTTP server at the same `BOOKWRITER_DATA_DIR`**
+(or leave both at the default) so they share state.
 
 ## Claude Desktop configuration
 
@@ -81,18 +83,19 @@ Edit Claude Desktop's config file:
 - Windows: `%APPDATA%\Claude\claude_desktop_config.json`
 - macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
 
-Add (or merge) the `bookwriter` entry. This is the exact snippet written for
-this machine:
+Add (or merge) the `bookwriter` entry, replacing `<path-to>/BookwritterPro`
+with your checkout (on Windows use double backslashes, e.g.
+`C:\\path\\to\\BookwritterPro`):
 
 ```json
 {
   "mcpServers": {
     "bookwriter": {
-      "command": "C:\\Users\\VR\\AppData\\Local\\Programs\\Python\\Python313\\python.exe",
+      "command": "python",
       "args": ["-m", "bookwriter.mcp_server"],
-      "cwd": "C:\\Users\\VR\\projects\\BookwritterPro",
+      "cwd": "<path-to>/BookwritterPro",
       "env": {
-        "BOOKWRITER_DATA_DIR": "C:\\Users\\VR\\projects\\BookwritterPro\\.bookwriter_data",
+        "BOOKWRITER_DATA_DIR": "<path-to>/BookwritterPro/.bookwriter_data",
         "ANTHROPIC_API_KEY": "sk-ant-...replace-or-omit-for-mock-only..."
       }
     }
@@ -101,9 +104,15 @@ this machine:
 ```
 
 Notes:
+- `command` is your Python interpreter — `python3` on macOS/Linux, or the full
+  path to `python.exe` on Windows if `python` isn't on the PATH Claude Desktop
+  sees (GUI apps don't always inherit your shell PATH).
 - `cwd` must be the project root so `python -m bookwriter.mcp_server` resolves
   the `bookwriter` package.
-- Omit `ANTHROPIC_API_KEY` if you only ever call tools with `mock=True`.
+- Set the key for the provider you use (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
+  `OPENROUTER_API_KEY`, `GROK_API_KEY`, ... plus `BOOKWRITER_LLM_PROVIDER` if
+  not Anthropic) — or omit keys entirely if you only ever call tools with
+  `mock=True`.
 - Restart Claude Desktop after editing the config. The `bookwriter` tools then
   appear in the tools menu.
 
@@ -113,23 +122,25 @@ Claude Code reads MCP servers from `.mcp.json` (project scope) or your user
 config. The fastest path is the CLI:
 
 ```bash
+# replace <path-to>/BookwritterPro with your checkout; python3 on macOS/Linux
 claude mcp add bookwriter \
   --scope user \
-  --env BOOKWRITER_DATA_DIR=C:\\Users\\VR\\projects\\BookwritterPro\\.bookwriter_data \
-  -- C:\\Users\\VR\\AppData\\Local\\Programs\\Python\\Python313\\python.exe -m bookwriter.mcp_server
+  --env BOOKWRITER_DATA_DIR=<path-to>/BookwritterPro/.bookwriter_data \
+  -- python -m bookwriter.mcp_server
 ```
 
-Or add it by hand to a project-root `.mcp.json` (same schema as Claude Desktop):
+Or add it by hand to a project-root `.mcp.json` (same schema as Claude Desktop;
+on Windows use double backslashes in the JSON paths):
 
 ```json
 {
   "mcpServers": {
     "bookwriter": {
-      "command": "C:\\Users\\VR\\AppData\\Local\\Programs\\Python\\Python313\\python.exe",
+      "command": "python",
       "args": ["-m", "bookwriter.mcp_server"],
-      "cwd": "C:\\Users\\VR\\projects\\BookwritterPro",
+      "cwd": "<path-to>/BookwritterPro",
       "env": {
-        "BOOKWRITER_DATA_DIR": "C:\\Users\\VR\\projects\\BookwritterPro\\.bookwriter_data"
+        "BOOKWRITER_DATA_DIR": "<path-to>/BookwritterPro/.bookwriter_data"
       }
     }
   }

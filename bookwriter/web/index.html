@@ -213,116 +213,6 @@
     </div>
   </template>
 
-  <!-- New book composer -->
-  <template id="tpl-new">
-    <section class="view view-new">
-      <div class="composer-shell">
-        <div class="composer-head">
-          <p class="eyebrow">New manuscript</p>
-          <h1 class="display">Begin with a premise.</h1>
-          <p class="lede">Give the engine a seed. It plans a story bible, an act structure, and a chapter outline — then writes the prose live.</p>
-        </div>
-
-      <div class="composer-layout">
-        <!-- LIVE COVER FORGE: a procedurally-generated jacket that designs itself
-             as the title/genre are typed (debounced, reduced-motion-safe). -->
-        <aside class="forge" aria-label="Live cover preview">
-          <div class="forge-stage">
-            <div class="forge-book" id="forge-book">
-              <div class="forge-cover" id="forge-cover" data-cover aria-hidden="true"></div>
-              <!-- Empty state: a crisp dashed book-silhouette frame (2:3) with a
-                   faint decorative ghost jacket behind a centred glyph + caption,
-                   so the pane reads as "a book waiting to be designed". -->
-              <div class="forge-empty" id="forge-empty">
-                <div class="forge-empty-ghost" id="forge-empty-ghost" aria-hidden="true"></div>
-                <div class="forge-empty-inner">
-                  <span class="forge-empty-glyph" aria-hidden="true">
-                    <svg viewBox="0 0 24 24" width="30" height="30"><path d="M5 6c3-2 8-2 11 0 3-2 8-2 11 0v15c-3-2-8-2-11 0-3-2-8-2-11 0V6z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><line x1="16" y1="6" x2="16" y2="21" stroke="currentColor" stroke-width="1.5"/></svg>
-                  </span>
-                  <p>Your cover takes shape<br>as you type.</p>
-                </div>
-              </div>
-            </div>
-          </div>
-          <p class="forge-caption" id="forge-caption">Live cover preview</p>
-        </aside>
-
-        <form id="new-form" class="composer" novalidate>
-          <div class="field field-hero">
-            <label for="f-premise">Premise <span class="req">*</span></label>
-            <textarea id="f-premise" name="premise" rows="4" required
-              placeholder="A lighthouse keeper on a dying coast discovers the light is the only thing holding back something in the water…"></textarea>
-            <p class="field-hint">One or two sentences. The richer the seed, the richer the bible.</p>
-          </div>
-
-          <!-- Title is full-width on its own row so a normal book title is never
-               visually clipped — keeping the input and the live cover in visible
-               agreement (what-you-type-is-what-you-get). -->
-          <div class="field field-title">
-            <label for="f-title">Title <span class="opt">optional</span></label>
-            <input id="f-title" name="title" type="text" placeholder="Auto-generated if blank" />
-          </div>
-
-          <div class="field-row field-row-3">
-            <div class="field">
-              <label for="f-genre">Genre <span class="opt">optional</span></label>
-              <input id="f-genre" name="genre" type="text" placeholder="Literary horror, cozy mystery…" />
-            </div>
-            <div class="field">
-              <label for="f-chapters">Chapters</label>
-              <input id="f-chapters" name="chapters" type="number" min="1" max="60" placeholder="auto" />
-              <p class="field-hint">Leave blank to let the planner decide.</p>
-            </div>
-            <div class="field">
-              <label for="f-wpc">Words / chapter</label>
-              <input id="f-wpc" name="words_per_chapter" type="number" min="400" max="8000" step="100" value="2000" />
-              <p class="field-hint" id="wpc-estimate">~ a full-length book.</p>
-            </div>
-          </div>
-
-          <div class="field">
-            <label for="f-guidance">Guidance <span class="opt">optional</span></label>
-            <textarea id="f-guidance" name="guidance" rows="2"
-              placeholder="Tone, comparisons, things to avoid… e.g. 'spare prose à la Le Guin, no neat ending.'"></textarea>
-          </div>
-
-          <fieldset class="field profiles">
-            <legend>Quality profile</legend>
-            <div class="profile-grid" id="profile-grid" role="radiogroup" aria-label="Quality profile"></div>
-          </fieldset>
-
-          <div class="composer-foot">
-            <label class="switch" for="f-mock">
-              <input type="checkbox" id="f-mock" name="mock" />
-              <span class="switch-track" aria-hidden="true"><span class="switch-thumb"></span></span>
-              <span class="switch-label">
-                <strong>Demo mode</strong>
-                <span class="switch-sub">Generate offline with simulated prose — no API key needed.</span>
-              </span>
-            </label>
-
-            <details class="advanced">
-              <summary>Advanced</summary>
-              <div class="advanced-body">
-                <label class="check"><input type="checkbox" id="f-cache" checked /> Prompt caching <span class="muted">(cheaper, recommended)</span></label>
-                <label class="check"><input type="checkbox" id="f-continuity" checked /> Continuity checking <span class="muted">(flags plot holes)</span></label>
-              </div>
-            </details>
-
-            <div class="composer-actions">
-              <button type="submit" class="btn btn-primary btn-lg" id="plan-btn">
-                <span class="btn-label">Plan this book</span>
-                <span class="btn-spinner" aria-hidden="true"></span>
-              </button>
-              <p class="composer-note" id="composer-note"></p>
-            </div>
-          </div>
-        </form>
-      </div>
-      </div>
-    </section>
-  </template>
-
   <!-- Studio view -->
   <template id="tpl-studio">
     <section class="view view-studio">
@@ -842,6 +732,7 @@
                   <div class="field"><label for="set-codex">Codex CLI command</label><input id="set-codex" type="text" data-opt="BOOKWRITER_CODEX_CMD" placeholder="codex exec" /></div>
                   <div class="field"><label for="set-grok">Grok CLI command</label><input id="set-grok" type="text" data-opt="BOOKWRITER_GROK_CMD" placeholder="grok" /></div>
                 </div>
+                <div class="field"><label for="set-cli-timeout">CLI timeout (seconds)</label><input id="set-cli-timeout" type="text" data-opt="BOOKWRITER_CLI_TIMEOUT" placeholder="600" /></div>
                 <div class="field"><label for="set-pixio-model">Pixio model id</label><input id="set-pixio-model" type="text" data-opt="BOOKWRITER_PIXIO_MODEL" placeholder="(auto-discovered)" /></div>
               </div>
             </details>

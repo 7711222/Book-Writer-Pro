@@ -37,4 +37,10 @@ def check_chapter(
         cached=None,
         use_cache=False,
     )
-    return data.get("issues", [])
+    issues = data.get("issues", [])
+    if not isinstance(issues, list):
+        return []
+    # The json_object provider path can't structurally enforce the schema —
+    # drop non-dict entries so the pipeline's severity/description reads
+    # never crash (which would be misreported as a failed extraction).
+    return [i for i in issues if isinstance(i, dict)]

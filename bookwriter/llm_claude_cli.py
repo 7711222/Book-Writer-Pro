@@ -25,8 +25,45 @@ import shutil
 import subprocess
 from typing import Any, Callable, Dict, Optional
 
+from . import runtime_config as rc
 from .costs import CostLedger, Usage
 from .provider import resolve_model, target_model
+
+# Default seconds before a hung CLI subprocess is killed (BOOKWRITER_CLI_TIMEOUT).
+_DEFAULT_CLI_TIMEOUT = 600.0
+
+
+def _cli_timeout() -> float:
+    """Subprocess timeout in seconds — BOOKWRITER_CLI_TIMEOUT, default 600."""
+    raw = rc.getenv("BOOKWRITER_CLI_TIMEOUT") or ""
+    try:
+        return float(raw) if raw.strip() else _DEFAULT_CLI_TIMEOUT
+    except ValueError:
+        return _DEFAULT_CLI_TIMEOUT
+
+
+def _subprocess_runner(args, stdin):
+    """Default runner for every CLI backend: run the command with a hang-proof
+    timeout. A CLI stuck on an interactive login/trust prompt (or a stalled
+    network call) must not block a generation job forever."""
+    timeout = _cli_timeout()
+    try:
+        proc = subprocess.run(
+            args,
+            input=stdin,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            f"`{args[0]}` produced no result within {timeout:.0f}s — is the CLI "
+            f"signed in and non-interactive? (set BOOKWRITER_CLI_TIMEOUT to raise "
+            f"the limit)"
+        ) from None
+    return proc.returncode, proc.stdout, proc.stderr
 
 
 class ClaudeCliLLM:
@@ -40,7 +77,7 @@ class ClaudeCliLLM:
     def __init__(self, binary: Optional[str] = None, runner: Optional[Callable] = None,
                  model_override: Optional[str] = None):
         self.binary = binary or shutil.which("claude") or "claude"
-        self._runner = runner or self._subprocess_runner
+        self._runner = runner or _subprocess_runner
         self.model_override = model_override
 
     # ------------------------------------------------------------------
@@ -90,18 +127,6 @@ class ClaudeCliLLM:
         return text, usage
 
     # ------------------------------------------------------------------
-    @staticmethod
-    def _subprocess_runner(args, stdin):
-        proc = subprocess.run(
-            args,
-            input=stdin,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
-        return proc.returncode, proc.stdout, proc.stderr
-
     @staticmethod
     def _record(ledger: CostLedger, stage: str, model: str, usage: Dict[str, Any],
                 cache_ttl: str) -> None:

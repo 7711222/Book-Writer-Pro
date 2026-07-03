@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 from typing import List, Optional
 
@@ -23,6 +24,53 @@ from .config import Settings, QUALITY_PROFILES, MODEL_PRICES
 from .llm import LLM
 from .pipeline import BookPipeline
 from .store import BookStore
+
+_ENV_KEY_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+
+
+def load_env_file(path: Optional[str] = None) -> int:
+    """Load ``KEY=VALUE`` lines from a .env file into ``os.environ``.
+
+    The file is *path* if given, else ``$BOOKWRITER_ENV_FILE``, else ``./.env``
+    in the current directory; a missing file is a silent no-op. The parser is
+    deliberately tiny (stdlib only): blank lines and ``#`` comments are
+    skipped, an optional ``export `` prefix is dropped, values may be single-
+    or double-quoted, and unquoted values may carry a trailing ``# comment``.
+    Variables already present in the environment are NEVER overridden — what
+    you export in your shell always wins. Returns how many variables were set.
+    """
+    path = path or os.environ.get("BOOKWRITER_ENV_FILE") or ".env"
+    try:
+        # utf-8-sig: tolerate the UTF-8 BOM that Notepad/PowerShell often add,
+        # which would otherwise glue U+FEFF onto the first key and skip it.
+        with open(path, "r", encoding="utf-8-sig") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return 0
+    loaded = 0
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if not _ENV_KEY_RE.match(key):
+            continue
+        value = value.strip()
+        if value[:1] in ("'", '"'):
+            # quoted: take everything up to the matching quote, verbatim
+            closing = value.find(value[0], 1)
+            if closing != -1:
+                value = value[1:closing]
+        else:
+            # unquoted: allow a trailing inline comment ("KEY=val  # note")
+            value = re.split(r"\s+#", value, maxsplit=1)[0].rstrip()
+        if key not in os.environ:
+            os.environ[key] = value
+            loaded += 1
+    return loaded
 
 
 def _make_llm(args) -> LLM:
@@ -191,11 +239,18 @@ def cmd_price(args) -> int:
         raise SystemExit("error: no plan found in project; run 'generate' first")
 
     pages = estimate_page_count(graph)
+    # Use the real built EPUB's size for the delivery-fee math when one
+    # exists (from a prior `kdp` run); else keep the 1.0 MB default.
+    ebook_file_mb = 1.0
+    epub = os.path.join(args.project, "kdp", "manuscript.epub")
+    if os.path.isfile(epub):
+        ebook_file_mb = os.path.getsize(epub) / 1e6
     est = estimate_royalties(
         list_price=args.list_price,
         marketplace=args.marketplace or "US",
         page_count=pages,
         paper=args.paper or "white",
+        ebook_file_mb=ebook_file_mb,
     )
     eb = est["ebook"]
     pb = est["paperback"]
@@ -497,6 +552,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    load_env_file()  # ./.env (or BOOKWRITER_ENV_FILE); shell exports always win
     args = build_parser().parse_args(argv)
     try:
         return args.func(args) or 0

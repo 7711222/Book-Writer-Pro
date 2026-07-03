@@ -12,13 +12,16 @@ call time, saving a key takes effect immediately for the next generation — no
 restart, no env vars.
 
 Security note: this is a local-first, single-user app served on 127.0.0.1. Keys
-are stored in the data dir (file mode 600 where the OS supports it) and are never
-returned to the client in full or logged — the API exposes only masked hints.
+are stored as plaintext JSON in the data dir; the file is restricted to the
+current user (chmod 600 on POSIX, an icacls owner-only ACL on Windows) and keys
+are never returned to the client in full or logged — the API exposes only
+masked hints.
 """
 from __future__ import annotations
 
 import json
 import os
+import subprocess
 import threading
 from typing import Dict, List, Optional
 
@@ -49,6 +52,7 @@ OPTION_KEYS: List[str] = [
     "BOOKWRITER_GROK_CMD",
     "BOOKWRITER_CLI_CMD",
     "BOOKWRITER_CLI_MODEL_FLAG",
+    "BOOKWRITER_CLI_TIMEOUT",
     "OPENAI_BASE_URL",
     "OPENROUTER_BASE_URL",
     "GROK_BASE_URL",
@@ -61,6 +65,7 @@ OPTION_KEYS: List[str] = [
     "BOOKWRITER_IMAGE_BODY",
     "BOOKWRITER_IMAGE_RESULT_PATH",
     "BOOKWRITER_IMAGE_RESULT_B64",
+    "BOOKWRITER_IMAGE_ALLOW_PRIVATE",
 ]
 
 MANAGED_KEYS: List[str] = SECRET_KEYS + OPTION_KEYS
@@ -98,11 +103,70 @@ def save() -> None:
     d = os.path.dirname(_path) or "."
     os.makedirs(d, exist_ok=True)
     tmp = _path + ".tmp"
+    # Create the temp file empty and restrict it BEFORE any secret bytes land in
+    # it; os.replace keeps the tightened permissions on the final file.
+    with open(tmp, "w", encoding="utf-8"):
+        pass
+    _restrict_to_owner(tmp)
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
     os.replace(tmp, _path)
+    _restrict_to_owner(_path)
+
+
+_win_user_sid: Optional[str] = None  # cached; one `whoami` per process
+
+
+def _current_user_sid() -> Optional[str]:
+    """The current Windows user's SID — icacls grants by SID are unambiguous,
+    whereas a bare username can resolve to the machine/domain and lock the
+    file away from everyone (including us)."""
+    global _win_user_sid
+    if _win_user_sid:
+        return _win_user_sid
     try:
-        os.chmod(_path, 0o600)  # best-effort; no-op semantics on Windows
+        out = subprocess.run(
+            ["whoami", "/user", "/fo", "csv", "/nh"],
+            capture_output=True, text=True, check=False, timeout=20,
+        )
+        sid = out.stdout.strip().rsplit(",", 1)[-1].strip().strip('"')
+        if sid.upper().startswith("S-1-"):
+            _win_user_sid = sid
+            return sid
+    except Exception:  # noqa: BLE001 - whoami missing/blocked -> best-effort
+        pass
+    return None
+
+
+def _restrict_to_owner(path: str) -> None:
+    """Best-effort: the file holds plaintext API keys, so keep it readable by
+    the current user only. POSIX: chmod 600. Windows: chmod cannot restrict
+    reads, so strip ACL inheritance and grant only the current user (icacls).
+    """
+    if os.name == "nt":
+        sid = _current_user_sid()
+        if not sid:
+            return
+        try:
+            subprocess.run(
+                ["icacls", path, "/inheritance:r", "/grant:r", f"*{sid}:F"],
+                capture_output=True, check=False, timeout=20,
+            )
+            with open(path, "rb"):
+                pass  # confirm we still have access
+        except OSError:
+            # Never lock the app out of its own settings — restore the
+            # inherited permissions (the owner always keeps WRITE_DAC).
+            try:
+                subprocess.run(["icacls", path, "/reset"],
+                               capture_output=True, check=False, timeout=20)
+            except Exception:  # noqa: BLE001
+                pass
+        except Exception:  # noqa: BLE001 - icacls missing/blocked -> best-effort
+            pass
+        return
+    try:
+        os.chmod(path, 0o600)
     except OSError:
         pass
 

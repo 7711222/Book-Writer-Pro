@@ -47,6 +47,11 @@ def _configure_logging() -> None:
 
 
 def main() -> None:
+    # Load ./.env (or BOOKWRITER_ENV_FILE) BEFORE reading any configuration —
+    # log level, host/port, keys. Variables already exported in the shell win.
+    from .cli import load_env_file
+    load_env_file()
+
     _configure_logging()
     log = logging.getLogger("bookwriter.serve")
 
