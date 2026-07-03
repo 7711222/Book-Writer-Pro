@@ -6,6 +6,9 @@ adapter gets a fake subprocess runner. No SDKs, no network, no API keys.
 import json
 import os
 import unittest
+from importlib.util import find_spec
+
+_HAS_ANTHROPIC = bool(find_spec("anthropic"))
 
 from bookwriter import provider
 from bookwriter.config import StageModel
@@ -139,20 +142,25 @@ class _FakeMessage:
 
 
 class _FakeChoice:
-    def __init__(self, content=None, delta_content=None):
+    def __init__(self, content=None, delta_content=None, finish_reason=None):
         self.message = _FakeMessage(content) if content is not None else None
         self.delta = type("D", (), {"content": delta_content})()
+        self.finish_reason = finish_reason
 
 
 class _FakeResp:
-    def __init__(self, content, usage):
-        self.choices = [_FakeChoice(content=content)]
+    def __init__(self, content, usage, finish_reason=None):
+        self.choices = [_FakeChoice(content=content, finish_reason=finish_reason)]
         self.usage = usage
 
 
 class _FakeChunk:
-    def __init__(self, delta_content=None, usage=None):
-        self.choices = [_FakeChoice(delta_content=delta_content)] if delta_content is not None else []
+    def __init__(self, delta_content=None, usage=None, finish_reason=None):
+        if delta_content is not None or finish_reason is not None:
+            self.choices = [_FakeChoice(delta_content=delta_content,
+                                        finish_reason=finish_reason)]
+        else:
+            self.choices = []
         self.usage = usage
 
 
@@ -220,6 +228,30 @@ class TestOpenAIAdapter(unittest.TestCase):
     def test_strip_fences(self):
         self.assertEqual(_strip_fences("```json\n{\"x\":1}\n```"), '{"x":1}')
         self.assertEqual(_strip_fences('{"x":1}'), '{"x":1}')
+
+    def test_complete_json_truncated_raises(self):
+        # finish_reason=length means the JSON payload is cut off mid-object —
+        # fail with the real cause, not a cryptic JSONDecodeError.
+        from bookwriter.llm import TruncatedOutputError
+        resp = _FakeResp('{"a": 1', _FakeUsage(100, 20), finish_reason="length")
+        llm = OpenAICompatLLM(provider="openai", client=_FakeOpenAIClient(json_resp=resp))
+        with self.assertRaises(TruncatedOutputError):
+            llm.complete_json(stage="plan", model=self._model(), system="s", user="u",
+                              schema={"type": "object"}, max_tokens=10, ledger=CostLedger())
+        self.assertEqual(llm.last_stop_reason, "max_tokens")
+
+    def test_complete_text_flags_length_truncation(self):
+        chunks = [
+            _FakeChunk(delta_content="Half a chapter"),
+            _FakeChunk(finish_reason="length"),
+            _FakeChunk(usage=_FakeUsage(50, 8)),
+        ]
+        llm = OpenAICompatLLM(provider="openai", client=_FakeOpenAIClient(stream_chunks=chunks))
+        text = llm.complete_text(stage="write", model=self._model(), system="s",
+                                 user="u", max_tokens=10, ledger=CostLedger())
+        # prose is NOT discarded, but the truncation is recorded for the pipeline
+        self.assertEqual(text, "Half a chapter")
+        self.assertEqual(llm.last_stop_reason, "max_tokens")
 
 
 # --------------------------------------------------------------------------- #
@@ -415,7 +447,8 @@ class TestMakeLlmCliRouting(_EnvGuard):
 
 class TestAnthropicThinkingParam(unittest.TestCase):
     """_thinking_param: adaptive when on; disabled off — except Fable 5, which
-    400s on an explicit disabled and must omit the param (returns None)."""
+    400s on an explicit disabled and must omit the param (returns None). Both
+    it and _output_config gate on the EFFECTIVE model when one is given."""
 
     def test_adaptive_when_thinking_on(self):
         from bookwriter.llm import _thinking_param
@@ -431,6 +464,210 @@ class TestAnthropicThinkingParam(unittest.TestCase):
         from bookwriter.llm import _thinking_param
         sm = StageModel("claude-fable-5", thinking=False)
         self.assertIsNone(_thinking_param(sm))
+
+    def test_adaptive_omitted_when_effective_model_lacks_support(self):
+        # A per-book Haiku override must not inherit the profile model's
+        # adaptive thinking — Haiku 4.5 rejects it with a 400.
+        from bookwriter.llm import _thinking_param
+        sm = StageModel("claude-opus-4-8", thinking=True)
+        self.assertIsNone(_thinking_param(sm, "claude-haiku-4-5"))
+        self.assertEqual(_thinking_param(sm, "claude-sonnet-4-6"), {"type": "adaptive"})
+
+    def test_effort_gated_on_effective_model(self):
+        from bookwriter.llm import _output_config
+        sm = StageModel("claude-opus-4-8", effort="high")
+        self.assertIsNone(_output_config(sm, "claude-haiku-4-5"))
+        self.assertEqual(_output_config(sm, "claude-sonnet-4-6"), {"effort": "high"})
+        self.assertEqual(_output_config(sm), {"effort": "high"})
+
+
+# --------------------------------------------------------------------------- #
+# Anthropic adapter (the default live provider), with a fake SDK client
+# --------------------------------------------------------------------------- #
+
+class _FakeAnthUsage:
+    def __init__(self, input_tokens=100, output_tokens=40,
+                 cache_creation=0, cache_read=0):
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
+        self.cache_creation_input_tokens = cache_creation
+        self.cache_read_input_tokens = cache_read
+
+
+class _FakeAnthBlock:
+    type = "text"
+
+    def __init__(self, text):
+        self.text = text
+
+
+class _FakeAnthMessage:
+    def __init__(self, text="", usage=None, stop_reason="end_turn"):
+        self.content = [_FakeAnthBlock(text)]
+        self.usage = usage or _FakeAnthUsage()
+        self.stop_reason = stop_reason
+
+
+class _FakeAnthStream:
+    """Mimics `with client.messages.stream(...) as s:` — a context manager with
+    a .text_stream iterator and .get_final_message()."""
+
+    def __init__(self, chunks, final):
+        self.text_stream = iter(chunks)
+        self._final = final
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def get_final_message(self):
+        return self._final
+
+
+class _FakeAnthMessages:
+    def __init__(self, parent):
+        self._p = parent
+
+    def create(self, **kwargs):
+        self._p.calls.append(kwargs)
+        return self._p.message
+
+    def stream(self, **kwargs):
+        self._p.calls.append(kwargs)
+        return _FakeAnthStream(self._p.chunks, self._p.message)
+
+
+class _FakeAnthropicClient:
+    def __init__(self, message, chunks=None):
+        self.calls = []
+        self.message = message
+        self.chunks = chunks or []
+        self.messages = _FakeAnthMessages(self)
+
+
+def _anthropic_llm(message, chunks=None, model_override=None):
+    # api_key given so construction never needs ambient credentials; the real
+    # client is then swapped for the fake (nothing touches the network).
+    from bookwriter.llm import AnthropicLLM
+    llm = AnthropicLLM(api_key="sk-test", model_override=model_override)
+    llm.client = _FakeAnthropicClient(message, chunks)
+    return llm
+
+
+@unittest.skipUnless(_HAS_ANTHROPIC, "anthropic SDK not installed")
+class TestAnthropicAdapter(unittest.TestCase):
+    def _model(self, **kw):
+        return StageModel("claude-opus-4-8", effort="high", **kw)
+
+    def test_complete_json_request_shape_and_cache_control(self):
+        llm = _anthropic_llm(_FakeAnthMessage('{"ok": true}'))
+        ledger = CostLedger()
+        out = llm.complete_json(
+            stage="plan", model=self._model(), system="SYS", user="U",
+            schema={"type": "object"}, max_tokens=500, ledger=ledger,
+            cached="BIBLE", use_cache=True, cache_ttl="1h",
+        )
+        self.assertEqual(out, {"ok": True})
+        kwargs = llm.client.calls[0]
+        self.assertEqual(kwargs["model"], "claude-opus-4-8")
+        self.assertEqual(kwargs["system"][0], {"type": "text", "text": "SYS"})
+        self.assertEqual(kwargs["system"][1],
+                         {"type": "text", "text": "BIBLE",
+                          "cache_control": {"type": "ephemeral", "ttl": "1h"}})
+        self.assertEqual(kwargs["output_config"],
+                         {"effort": "high",
+                          "format": {"type": "json_schema",
+                                     "schema": {"type": "object"}}})
+        self.assertEqual(kwargs["thinking"], {"type": "adaptive"})
+        self.assertEqual(len(ledger.entries), 1)
+
+    def test_no_cache_control_when_cache_off(self):
+        llm = _anthropic_llm(_FakeAnthMessage("{}"))
+        llm.complete_json(stage="plan", model=self._model(), system="SYS", user="U",
+                          schema={"type": "object"}, max_tokens=10,
+                          ledger=CostLedger(), cached="BIBLE", use_cache=False)
+        self.assertNotIn("cache_control", llm.client.calls[0]["system"][1])
+
+    def test_thinking_param_wiring(self):
+        # Fable 5 with thinking off must OMIT the key entirely; haiku with
+        # thinking off sends an explicit disabled.
+        llm = _anthropic_llm(_FakeAnthMessage("{}"))
+        llm.complete_json(stage="plan",
+                          model=StageModel("claude-fable-5", thinking=False),
+                          system="s", user="u", schema={"type": "object"},
+                          max_tokens=10, ledger=CostLedger())
+        self.assertNotIn("thinking", llm.client.calls[0])
+        llm.complete_json(stage="plan",
+                          model=StageModel("claude-haiku-4-5", thinking=False),
+                          system="s", user="u", schema={"type": "object"},
+                          max_tokens=10, ledger=CostLedger())
+        self.assertEqual(llm.client.calls[1]["thinking"], {"type": "disabled"})
+
+    def test_override_gates_effort_and_thinking_on_effective_model(self):
+        # Per-book Haiku override: effort + adaptive thinking must both be
+        # dropped, or every plan/write call 400s on the live API.
+        llm = _anthropic_llm(_FakeAnthMessage("{}"),
+                             model_override="claude-haiku-4-5")
+        llm.complete_json(stage="plan",
+                          model=StageModel("claude-opus-4-8", effort="high", thinking=True),
+                          system="s", user="u", schema={"type": "object"},
+                          max_tokens=10, ledger=CostLedger())
+        kwargs = llm.client.calls[0]
+        self.assertEqual(kwargs["model"], "claude-haiku-4-5")
+        self.assertNotIn("thinking", kwargs)
+        self.assertNotIn("effort", kwargs["output_config"])
+        self.assertIn("format", kwargs["output_config"])
+
+    def test_override_not_applied_to_mechanical_stages(self):
+        # The per-book text-model pick only covers plan/write; extract keeps
+        # the profile's cheap model.
+        llm = _anthropic_llm(_FakeAnthMessage("{}"),
+                             model_override="claude-sonnet-4-6")
+        llm.complete_json(stage="extract",
+                          model=StageModel("claude-haiku-4-5", effort="low", thinking=False),
+                          system="s", user="u", schema={"type": "object"},
+                          max_tokens=10, ledger=CostLedger())
+        self.assertEqual(llm.client.calls[0]["model"], "claude-haiku-4-5")
+
+    def test_complete_text_streams_and_records_cache_usage(self):
+        usage = _FakeAnthUsage(input_tokens=10, output_tokens=20,
+                               cache_creation=300, cache_read=4000)
+        final = _FakeAnthMessage("Full chapter text.", usage=usage)
+        llm = _anthropic_llm(final, chunks=["Full ", "chapter ", "text."])
+        ledger = CostLedger()
+        seen = []
+        text = llm.complete_text(stage="write", model=self._model(), system="SYS",
+                                 user="go", max_tokens=100, ledger=ledger,
+                                 cached="BIBLE", on_delta=seen.append)
+        self.assertEqual(text, "Full chapter text.")
+        self.assertEqual(seen, ["Full ", "chapter ", "text."])
+        e = ledger.entries[0]
+        self.assertEqual(e.input_tokens, 10)
+        self.assertEqual(e.output_tokens, 20)
+        self.assertEqual(e.cache_creation_tokens, 300)
+        self.assertEqual(e.cache_read_tokens, 4000)
+        self.assertEqual(llm.last_stop_reason, "end_turn")
+
+    def test_complete_json_truncated_raises(self):
+        from bookwriter.llm import TruncatedOutputError
+        llm = _anthropic_llm(_FakeAnthMessage('{"partial', stop_reason="max_tokens"))
+        with self.assertRaises(TruncatedOutputError):
+            llm.complete_json(stage="plan", model=self._model(), system="s",
+                              user="u", schema={"type": "object"},
+                              max_tokens=10, ledger=CostLedger())
+        self.assertEqual(llm.last_stop_reason, "max_tokens")
+
+    def test_complete_text_truncation_sets_stop_reason(self):
+        llm = _anthropic_llm(_FakeAnthMessage("cut off mid-",
+                                              stop_reason="max_tokens"),
+                             chunks=["cut off mid-"])
+        text = llm.complete_text(stage="write", model=self._model(), system="s",
+                                 user="u", max_tokens=10, ledger=CostLedger())
+        # prose is NOT discarded, but the truncation is recorded for the pipeline
+        self.assertEqual(text, "cut off mid-")
+        self.assertEqual(llm.last_stop_reason, "max_tokens")
 
 
 if __name__ == "__main__":

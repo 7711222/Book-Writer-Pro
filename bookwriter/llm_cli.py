@@ -9,6 +9,11 @@ API key — the CLI carries the auth:
     grok-cli  a Grok CLI                          — X Premium / SuperGrok login
     cli       anything you set in BOOKWRITER_CLI_CMD
 
+CLIs that cannot read stdin (grok-cli) get the prompt as an argv element, which
+is capped by the OS (~32 KB on Windows). For big prompts put ``{promptfile}``
+in the configured command: the prompt is written to a temp file and the
+placeholder is replaced with its path.
+
 Because these CLIs rarely report token usage in a stable, parseable way, usage
 is *estimated* from text length (so the cost meter isn't blank) and recorded
 against the provider/model id — which is normally absent from MODEL_PRICES, so
@@ -21,13 +26,24 @@ to the prompt, then extract the first JSON object from stdout.
 from __future__ import annotations
 
 import json
-import shutil
-import subprocess
+import os
+import tempfile
 from typing import Any, Callable, List, Optional
 
 from .costs import CostLedger, Usage
-from .llm_claude_cli import _build_prompt, _strip_fences
-from .provider import resolve_model, target_model
+from .llm_claude_cli import _build_prompt, _strip_fences, _subprocess_runner
+from .provider import cli_cmd_env, resolve_model, target_model
+
+# Literal placeholder a user can put in BOOKWRITER_*_CMD: the prompt is written
+# to a temp file and the placeholder is replaced with that file's path. This is
+# the command-line-length-proof way to feed a big prompt to an argv-only CLI.
+PROMPT_FILE_TOKEN = "{promptfile}"
+
+# CLIs that take the prompt as an argv element hit the OS command-line limit:
+# ~32 KB for the whole line on Windows (CreateProcess), ~128 KB per argument on
+# Linux. Refuse above these with a clear message instead of a cryptic OSError
+# from deep inside subprocess.
+_ARGV_PROMPT_LIMIT = 30_000 if os.name == "nt" else 100_000
 
 
 class GenericCliLLM:
@@ -92,10 +108,35 @@ class GenericCliLLM:
         if self.model_flag:
             args += [self.model_flag, self._target(stage, model)]
         stdin = prompt
-        if not self.stdin:
-            args.append(prompt)
-            stdin = ""
-        code, out, err = self._runner(args, stdin)
+        prompt_file = None
+        try:
+            if any(PROMPT_FILE_TOKEN in a for a in args):
+                # Feed the prompt via a temp file — immune to argv length limits.
+                fd, prompt_file = tempfile.mkstemp(prefix="bookwriter-prompt-", suffix=".txt")
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(prompt)
+                args = [a.replace(PROMPT_FILE_TOKEN, prompt_file) for a in args]
+                stdin = ""
+            elif not self.stdin:
+                if len(prompt) > _ARGV_PROMPT_LIMIT:
+                    env = cli_cmd_env(self.provider)
+                    raise RuntimeError(
+                        f"The '{self.provider}' CLI takes the prompt as a command-line "
+                        f"argument, but this prompt is {len(prompt):,} characters — beyond "
+                        f"the ~{_ARGV_PROMPT_LIMIT // 1000} KB the OS allows on a command "
+                        f"line. Configure a stdin- or file-based invocation instead: set "
+                        f"{env} to a command containing {PROMPT_FILE_TOKEN}, which is "
+                        f"replaced with the path of a temp file holding the prompt."
+                    )
+                args.append(prompt)
+                stdin = ""
+            code, out, err = self._runner(args, stdin)
+        finally:
+            if prompt_file:
+                try:
+                    os.unlink(prompt_file)
+                except OSError:
+                    pass
         if code != 0:
             raise RuntimeError(
                 f"`{' '.join(self.command)}` (provider '{self.provider}') exited "
@@ -120,18 +161,6 @@ class GenericCliLLM:
             cache_read_tokens=0,
             cache_ttl=cache_ttl,
         ))
-
-
-def _subprocess_runner(args, stdin):
-    proc = subprocess.run(
-        args,
-        input=stdin,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
-    return proc.returncode, proc.stdout, proc.stderr
 
 
 def _extract_json(text: str) -> str:

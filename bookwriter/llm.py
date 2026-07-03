@@ -17,11 +17,21 @@ from __future__ import annotations
 import json
 from typing import Any, Callable, Dict, List, Optional, Protocol
 
-from .config import StageModel, EFFORT_CAPABLE
+from .config import StageModel, EFFORT_CAPABLE, ADAPTIVE_CAPABLE
 from .costs import CostLedger, Usage
 
 
+class TruncatedOutputError(RuntimeError):
+    """A JSON-stage response stopped at ``max_tokens`` — the payload is cut off
+    mid-object and can never parse. Raised instead of letting ``json.loads``
+    fail with a cryptic decode error; the fix is raising the stage's token cap."""
+
+
 class LLM(Protocol):
+    # Implementations MAY also expose a ``last_stop_reason`` attribute (set after
+    # each call; ``"max_tokens"`` marks a truncated response). It is read via
+    # ``getattr(llm, "last_stop_reason", None)`` so adapters that don't track it
+    # (the subscription CLIs) need no change.
     def complete_json(
         self, *, stage: str, model: StageModel, system: str, user: str,
         schema: Dict[str, Any], max_tokens: int, ledger: CostLedger,
@@ -51,18 +61,28 @@ def _build_system(system: str, cached: Optional[str], use_cache: bool, cache_ttl
 _THINKING_OMIT_WHEN_DISABLED = frozenset({"claude-fable-5"})
 
 
-def _thinking_param(sm: StageModel) -> Optional[Dict[str, Any]]:
-    """The ``thinking`` request value, or ``None`` to omit the param entirely."""
+def _thinking_param(sm: StageModel, mdl: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """The ``thinking`` request value for the EFFECTIVE model ``mdl`` (defaults
+    to the profile model), or ``None`` to omit the param entirely.
+
+    Gating on the effective id matters when a per-book override redirects a
+    stage to a model that doesn't support adaptive thinking (e.g. Haiku 4.5):
+    sending ``{"type": "adaptive"}`` there would 400 every request, so the
+    param is omitted instead."""
+    mdl = mdl or sm.model
     if sm.thinking:
-        return {"type": "adaptive"}
-    if sm.model in _THINKING_OMIT_WHEN_DISABLED:
+        return {"type": "adaptive"} if mdl in ADAPTIVE_CAPABLE else None
+    if mdl in _THINKING_OMIT_WHEN_DISABLED:
         return None
     return {"type": "disabled"}
 
 
-def _output_config(sm: StageModel, fmt: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+def _output_config(sm: StageModel, mdl: Optional[str] = None,
+                   fmt: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    """Build ``output_config``, gating ``effort`` on the EFFECTIVE model ``mdl``
+    (a per-book override may pick a model that rejects the effort param)."""
     cfg: Dict[str, Any] = {}
-    if sm.model in EFFORT_CAPABLE:
+    if (mdl or sm.model) in EFFORT_CAPABLE:
         cfg["effort"] = sm.effort
     if fmt is not None:
         cfg["format"] = fmt
@@ -82,6 +102,9 @@ class AnthropicLLM:
             ) from e
         self._anthropic = anthropic
         self.model_override = model_override
+        # Why the last response stopped ("end_turn", "max_tokens", ...). The
+        # pipeline reads it right after a prose call to flag truncated chapters.
+        self.last_stop_reason: Optional[str] = None
         self.client = anthropic.Anthropic(api_key=api_key) if api_key else anthropic.Anthropic()
 
     def _model_for(self, stage: str, model: StageModel) -> str:
@@ -92,8 +115,8 @@ class AnthropicLLM:
     def complete_json(self, *, stage, model, system, user, schema, max_tokens,
                        ledger, cached=None, use_cache=True, cache_ttl="1h"):
         sys_blocks = _build_system(system, cached, use_cache, cache_ttl)
-        out_cfg = _output_config(model, fmt={"type": "json_schema", "schema": schema})
         mdl = self._model_for(stage, model)
+        out_cfg = _output_config(model, mdl, fmt={"type": "json_schema", "schema": schema})
         params: Dict[str, Any] = {
             "model": mdl,
             "max_tokens": max_tokens,
@@ -101,11 +124,19 @@ class AnthropicLLM:
             "messages": [{"role": "user", "content": user}],
             "output_config": out_cfg,
         }
-        think = _thinking_param(model)
+        think = _thinking_param(model, mdl)
         if think is not None:
             params["thinking"] = think
         resp = self.client.messages.create(**params)
         self._record(ledger, stage, mdl, resp, cache_ttl)
+        self.last_stop_reason = getattr(resp, "stop_reason", None)
+        if self.last_stop_reason == "max_tokens":
+            # A cut-off JSON payload can never parse — fail with the real cause
+            # instead of a cryptic JSONDecodeError downstream.
+            raise TruncatedOutputError(
+                f"{stage}: JSON output truncated at max_tokens={max_tokens} — "
+                "raise the stage's max_tokens setting and retry."
+            )
         text = next((b.text for b in resp.content if getattr(b, "type", "") == "text"), "")
         return json.loads(text) if text else {}
 
@@ -113,15 +144,15 @@ class AnthropicLLM:
     def complete_text(self, *, stage, model, system, user, max_tokens,
                       ledger, cached=None, use_cache=True, cache_ttl="1h", on_delta=None):
         sys_blocks = _build_system(system, cached, use_cache, cache_ttl)
-        out_cfg = _output_config(model)
         mdl = self._model_for(stage, model)
+        out_cfg = _output_config(model, mdl)
         kwargs: Dict[str, Any] = {
             "model": mdl,
             "max_tokens": max_tokens,
             "system": sys_blocks,
             "messages": [{"role": "user", "content": user}],
         }
-        think = _thinking_param(model)
+        think = _thinking_param(model, mdl)
         if think is not None:
             kwargs["thinking"] = think
         if out_cfg:
@@ -134,6 +165,9 @@ class AnthropicLLM:
                     on_delta(chunk)
             final = stream.get_final_message()
         self._record(ledger, stage, mdl, final, cache_ttl)
+        # Don't raise for prose: the text up to the cut is still valuable. The
+        # pipeline reads last_stop_reason and flags the chapter as truncated.
+        self.last_stop_reason = getattr(final, "stop_reason", None)
         return "".join(b.text for b in final.content if getattr(b, "type", "") == "text")
 
     # ------------------------------------------------------------------

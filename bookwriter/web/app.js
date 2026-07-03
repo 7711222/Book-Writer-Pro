@@ -195,7 +195,6 @@ function srStatus(text) {
 
 /* ----------------------------- global state ----------------------------- */
 const State = {
-  profiles: null,
   hasApiKey: false,
 };
 
@@ -210,6 +209,7 @@ async function refreshHealth() {
       anthropic: "Anthropic API live",
       openai: "OpenAI live",
       openrouter: "OpenRouter live",
+      grok: "Grok (xAI) live",
       "claude-cli": "Claude CLI (subscription)",
       codex: "Codex CLI (ChatGPT sub)",
       "grok-cli": "Grok CLI (subscription)",
@@ -485,200 +485,6 @@ function attachTilt(card) {
   card.addEventListener("pointerleave", reset);
 }
 
-/* ------- Composer ------- */
-Views.composer = async function () {
-  const view = tpl("tpl-new");
-  mountView(view);
-  const form = $("#new-form", view);
-
-  // profiles
-  await ensureProfiles();
-  renderProfiles($("#profile-grid", view));
-
-  // demo-mode default + note
-  const mock = $("#f-mock", view);
-  const note = $("#composer-note", view);
-  if (!State.hasApiKey) {
-    mock.checked = true;
-    note.textContent = "No API key detected — Demo mode is on so you can try the full flow offline.";
-  }
-  mock.addEventListener("change", () => {
-    if (!mock.checked && !State.hasApiKey) {
-      note.textContent = "Heads up: no API key is set, so a live run will be rejected. Keep Demo mode on, or set ANTHROPIC_API_KEY.";
-      note.classList.remove("is-error");
-    } else { note.textContent = ""; note.classList.remove("is-error"); }
-  });
-
-  // words/chapter estimate
-  const wpc = $("#f-wpc", view), chap = $("#f-chapters", view), est = $("#wpc-estimate", view);
-  const updateEst = () => {
-    const w = Number(wpc.value) || 0, c = Number(chap.value) || 12;
-    const total = w * c;
-    if (!total) { est.textContent = "~ a full-length book."; return; }
-    est.textContent = `≈ ${fmtInt(total)} words total (${c} ch).`;
-  };
-  wpc.addEventListener("input", updateEst); chap.addEventListener("input", updateEst); updateEst();
-
-  // Live Cover Forge — the jacket designs itself as you type.
-  initCoverForge(view);
-
-  form.addEventListener("submit", (e) => onComposerSubmit(e, view));
-  $("#f-premise", view).focus();
-};
-
-/* ------- Live Cover Forge ------- */
-// A prominent, real-time book-cover preview beside the composer. It re-renders
-// (debounced) on title/genre/premise input so building a book feels like
-// watching its jacket design itself. STABILITY: a single seed is fixed for the
-// whole composer session and passed via opts.seed, so the palette + archetype
-// stay put while only the title text and the genre-driven motif change.
-function initCoverForge(view) {
-  const coverEl = $("#forge-cover", view);
-  const bookEl = $("#forge-book", view);
-  const emptyEl = $("#forge-empty", view);
-  if (!coverEl || !window.Covers || typeof window.Covers.svg !== "function") return;
-
-  // A stable per-session seed so the design stays anchored while typing. Salted
-  // with time+random so each new composer visit forges a fresh, distinct jacket.
-  const seed = "forge-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8);
-  const titleEl = $("#f-title", view), genreEl = $("#f-genre", view), premiseEl = $("#f-premise", view);
-  const reduce = () => window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-
-  // Derive a tasteful working title even before the user names the book, so the
-  // jacket never sits blank once they've started a premise.
-  const workingTitle = () => {
-    const t = (titleEl.value || "").trim();
-    if (t) return t;
-    const p = (premiseEl.value || "").trim();
-    if (p) {
-      // First few significant words of the premise as a provisional title.
-      const words = p.replace(/[.,;:!?"'—–-].*$/, "").split(/\s+/).filter(Boolean).slice(0, 5);
-      if (words.length) return words.join(" ");
-    }
-    return "";
-  };
-
-  const render = () => {
-    const title = workingTitle();
-    const genre = (genreEl.value || "").trim();
-    const hasInput = !!(title || genre);
-    if (emptyEl) emptyEl.hidden = hasInput;
-    coverEl.hidden = !hasInput;
-    if (!hasInput) { coverEl.innerHTML = ""; return; }
-    try {
-      coverEl.innerHTML = window.Covers.svg(
-        { id: seed, title: title || "Untitled", genre },
-        { seed }
-      );
-    } catch { /* leave previous render in place on any error */ return; }
-    // Subtle "re-stamp" micro-animation on each update (reduced-motion-safe).
-    if (!reduce()) {
-      bookEl.classList.remove("is-stamp");
-      void bookEl.offsetWidth; // restart the animation
-      bookEl.classList.add("is-stamp");
-    }
-  };
-
-  // Debounced (~120ms) so it feels live without thrashing on every keystroke.
-  let t = 0;
-  const onInput = () => { clearTimeout(t); t = setTimeout(render, 120); };
-  [titleEl, genreEl, premiseEl].forEach((el) => el && el.addEventListener("input", onInput));
-  render(); // initial (empty) state
-}
-
-async function ensureProfiles() {
-  if (State.profiles) return State.profiles;
-  try { State.profiles = await API.profiles(); }
-  catch { State.profiles = { default: "balanced", profiles: [] }; }
-  return State.profiles;
-}
-
-function renderProfiles(grid) {
-  const data = State.profiles || { default: "balanced", profiles: [] };
-  grid.innerHTML = "";
-  if (!data.profiles.length) {
-    grid.innerHTML = '<p class="rail-empty">Profiles unavailable.</p>';
-    return;
-  }
-  const order = ["premium", "balanced", "draft"];
-  const sorted = [...data.profiles].sort((a, b) => order.indexOf(a.name) - order.indexOf(b.name));
-  for (const p of sorted) {
-    const label = document.createElement("label");
-    label.className = "profile-opt";
-    const checked = p.name === (data.default || "balanced");
-    const stages = p.stages || {};
-    // Contract shape: plan/write/extract are bare model strings; check is
-    // {model, effort}. Normalize each stage to a model id for display.
-    const modelOf = (s) => (typeof s === "string" ? s : (s && s.model) || "");
-    const writeModel = modelOf(stages.write);
-    const price = (p.prices && p.prices[writeModel]) || null;
-    const stageRows = ["plan", "write", "extract", "check"].map((k) => {
-      if (!(k in stages)) return "";
-      const model = modelOf(stages[k]);
-      if (!model) return "";
-      return `<div class="po-stage"><b>${esc(k)}</b><code>${esc(model.replace("claude-", ""))}</code></div>`;
-    }).join("");
-    label.innerHTML =
-      `<input type="radio" name="profile" value="${esc(p.name)}" ${checked ? "checked" : ""}>` +
-      `<div class="po-name"><span class="po-check" aria-hidden="true"></span>${esc(p.name)}</div>` +
-      `<div class="po-stages">${stageRows}</div>` +
-      (price ? `<div class="po-price">prose: $${Number(price.input).toFixed(0)} in / $${Number(price.output).toFixed(0)} out · per 1M tok</div>` : "");
-    grid.appendChild(label);
-  }
-}
-
-async function onComposerSubmit(e, view) {
-  e.preventDefault();
-  const btn = $("#plan-btn", view);
-  const note = $("#composer-note", view);
-  note.textContent = ""; note.classList.remove("is-error");
-
-  const premise = $("#f-premise", view).value.trim();
-  if (!premise) {
-    note.textContent = "A premise is required — give it at least a sentence.";
-    note.classList.add("is-error");
-    $("#f-premise", view).focus();
-    return;
-  }
-  const profileEl = view.querySelector('input[name="profile"]:checked');
-  const payload = {
-    premise,
-    title: $("#f-title", view).value.trim() || undefined,
-    genre: $("#f-genre", view).value.trim() || undefined,
-    guidance: $("#f-guidance", view).value.trim() || undefined,
-    chapters: $("#f-chapters", view).value ? Number($("#f-chapters", view).value) : undefined,
-    words_per_chapter: Number($("#f-wpc", view).value) || 2000,
-    profile: profileEl ? profileEl.value : "balanced",
-    mock: $("#f-mock", view).checked,
-    use_cache: $("#f-cache", view).checked,
-    run_continuity_check: $("#f-continuity", view).checked,
-  };
-
-  btn.classList.add("is-busy"); btn.disabled = true;
-  $(".btn-label", btn).textContent = "Planning the bible…";
-  try {
-    const res = await API.createBook(payload);
-    // A brief, tasteful "binding" flourish on the live preview before we navigate
-    // to the studio (skipped under reduced-motion via the CSS class + flourish()).
-    const reduce = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-    const bookEl = $("#forge-book", view);
-    if (bookEl && !reduce) {
-      bookEl.classList.add("is-binding");
-      flourish(bookEl);
-      await new Promise((r) => setTimeout(r, 520));
-    }
-    toast("Your story bible is ready.", { title: res.book.title || "Planned", type: "good" });
-    Router.go(`#/b/${res.book.id}`);
-  } catch (err) {
-    note.textContent = err.message || "Planning failed.";
-    note.classList.add("is-error");
-    toast(err.message || "Planning failed.", { title: "Could not plan book", type: "error" });
-  } finally {
-    btn.classList.remove("is-busy"); btn.disabled = false;
-    $(".btn-label", btn).textContent = "Plan this book";
-  }
-}
-
 /* ===================== CREATE AI BOOK (modal) ========================= */
 // The book-setup dialog. Replaces the full-page composer as the "New book"
 // entry point: provider/model pickers (wired per-book to the backend provider
@@ -686,6 +492,27 @@ async function onComposerSubmit(e, view) {
 // with the live cover forge beside it. "Generate Outline" plans the book
 // (Step 1), then drops into the studio to review + write (Step 2).
 const reduceMotion = () => window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+/* Keep Tab cycling inside an open modal overlay. aria-modal="true" is only a
+   promise to assistive tech — it doesn't actually stop Tab from wandering into
+   the inert page behind, so each dialog wires this on open (the command palette
+   and help modal in palette.js trap focus the same way). */
+function trapFocus(overlay) {
+  overlay.addEventListener("keydown", (e) => {
+    if (e.key !== "Tab") return;
+    const els = Array.from(overlay.querySelectorAll(
+      'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+    )).filter((el) => !el.closest("[hidden]"));
+    if (!els.length) { e.preventDefault(); return; }
+    const first = els[0], last = els[els.length - 1];
+    const cur = document.activeElement;
+    if (e.shiftKey) {
+      if (cur === first || !overlay.contains(cur)) { e.preventDefault(); last.focus(); }
+    } else if (cur === last || !overlay.contains(cur)) {
+      e.preventDefault(); first.focus();
+    }
+  });
+}
 
 const CreateModal = {
   el: null, lastFocused: null, catalog: null, demoUserSet: false,
@@ -704,6 +531,7 @@ const CreateModal = {
     node.addEventListener("keydown", (e) => {
       if (e.key === "Escape") { e.preventDefault(); CreateModal.close(); }
     });
+    trapFocus(node);
 
     await CreateModal.populateProviders(node);
 
@@ -730,7 +558,9 @@ const CreateModal = {
     const node = CreateModal.el;
     if (!node) return;
     CreateModal.el = null;
-    if (!document.querySelector(".cmdk-overlay, .help-overlay")) document.body.classList.remove("cmdk-lock");
+    // Release the scroll lock only when no OTHER locking overlay remains open
+    // (overlays fading out keep their root class ~280ms — skip .is-closing).
+    if (!document.querySelector(".cmdk-overlay:not(.is-closing), .help-overlay:not(.is-closing), .settings-overlay:not(.is-closing), .import-overlay")) document.body.classList.remove("cmdk-lock");
     const finish = () => node.remove();
     if (reduceMotion()) finish();
     else {
@@ -902,10 +732,12 @@ const ImportModal = {
     ImportModal.lastFocused = document.activeElement;
     const node = tpl("tpl-import");
     document.body.appendChild(node);
+    document.body.classList.add("cmdk-lock");
     ImportModal.el = node;
     node.addEventListener("mousedown", (e) => { if (e.target === node) ImportModal.close(); });
     node.querySelector(".im-close").addEventListener("click", () => ImportModal.close());
     node.addEventListener("keydown", (e) => { if (e.key === "Escape") { e.preventDefault(); ImportModal.close(); } });
+    trapFocus(node);
 
     const text = node.querySelector("#im-text");
     const stat = node.querySelector("#im-stat");
@@ -940,6 +772,12 @@ const ImportModal = {
     if (!node) return;
     ImportModal.el = null;
     node.remove();
+    // Release the scroll lock unless another locking overlay is still open
+    // (this node is already out of the DOM, so it can't match itself; overlays
+    // mid-fade are excluded via .is-closing).
+    if (!document.querySelector(".cmdk-overlay:not(.is-closing), .help-overlay:not(.is-closing), .create-overlay:not(.is-closing)")) {
+      document.body.classList.remove("cmdk-lock");
+    }
     const prev = ImportModal.lastFocused; ImportModal.lastFocused = null;
     if (prev && prev.focus) prev.focus();
   },
@@ -1047,6 +885,7 @@ const SettingsModal = {
     node.addEventListener("mousedown", (e) => { if (e.target === node) SettingsModal.close(); });
     node.querySelector(".set-close").addEventListener("click", () => SettingsModal.close());
     node.addEventListener("keydown", (e) => { if (e.key === "Escape") { e.preventDefault(); SettingsModal.close(); } });
+    trapFocus(node);
     node.querySelector("#set-save").addEventListener("click", () => SettingsModal.save(node));
     node.querySelector("#set-img").addEventListener("change", () => SettingsModal.toggleHttp(node));
 
@@ -1056,13 +895,22 @@ const SettingsModal = {
 
     if (!reduceMotion()) requestAnimationFrame(() => node.classList.add("is-open"));
     else node.classList.add("is-open");
+    // Move focus INTO the dialog — the Escape handler and focus trap live on the
+    // overlay, so they only work once focus is inside it.
+    setTimeout(() => {
+      const f = node.querySelector("#set-llm") || node.querySelector(".set-close");
+      if (f) { try { f.focus(); } catch {} }
+    }, 60);
   },
 
   close() {
     const node = SettingsModal.el;
     if (!node) return;
     SettingsModal.el = null;
-    if (!document.querySelector(".cmdk-overlay, .help-overlay, .create-overlay:not(.settings-overlay)")) {
+    // Release the scroll lock only when no OTHER locking overlay remains open
+    // (this node keeps .create-overlay while fading — excluded via
+    // :not(.settings-overlay); overlays mid-fade are excluded via .is-closing).
+    if (!document.querySelector(".cmdk-overlay:not(.is-closing), .help-overlay:not(.is-closing), .create-overlay:not(.settings-overlay):not(.is-closing)")) {
       document.body.classList.remove("cmdk-lock");
     }
     const finish = () => node.remove();
@@ -1254,11 +1102,23 @@ const Studio = {
   streamingNum: null,  // chapter currently streaming
   buffers: {},         // number -> accumulated streamed text
   running: false,
+  startedLive: false,       // this session actually started/attached to a run
+  initiallyComplete: false, // book was fully written when the studio mounted
 
   teardown() {
-    if (Studio.es) { try { Studio.es.close(); } catch {} Studio.es = null; }
+    Studio.disconnect();
     Studio.id = null; Studio.data = null; Studio.active = null;
     Studio.streamingNum = null; Studio.buffers = {}; Studio.running = false;
+    Studio.startedLive = false; Studio.initiallyComplete = false;
+  },
+
+  // Close the SSE stream. The server ends the stream after a terminal event
+  // ('done'/'error'), and EventSource auto-reconnects (~3s) after ANY close —
+  // including a clean one — replaying the whole job history each time. So on
+  // terminal events we must close explicitly; onGenerate re-attaches via
+  // Studio.connect(true) for the next run.
+  disconnect() {
+    if (Studio.es) { try { Studio.es.close(); } catch {} Studio.es = null; }
   },
 };
 
@@ -1287,14 +1147,21 @@ Views.studio = async function (id) {
 
   try {
     const data = await API.book(id);
+    if (Studio.id !== id) return; // navigated away while loading — don't paint stale data
     Studio.data = data;
     Studio.renderShell();
     Studio.renderChapters();
     Studio.renderCost(data.cost);
     await Studio.renderGraphRail();
+    if (Studio.id !== id) return; // route moved on during the graph fetch
     // pick first written chapter, else first
     const written = (data.chapters || []).filter((c) => c.written);
     const total = (data.chapters || []).length;
+    // Reconnecting to the event stream replays the last job's whole history;
+    // remember whether this book was already fully written so replayed events
+    // don't re-fire follow/celebration side effects (see handleEvent).
+    Studio.startedLive = false;
+    Studio.initiallyComplete = total > 0 && written.length === total;
     if (written.length) Studio.openChapter(written[0].number);
     else Studio.showPlaceholder();
     // initial control label: Resume if partially written, else Generate
@@ -1304,6 +1171,7 @@ Views.studio = async function (id) {
     // connect to events to replay any in-progress / last job
     Studio.connect();
   } catch (err) {
+    if (Studio.id !== id) return;
     app().innerHTML = `<div class="empty-state"><h2 class="serif">We couldn't open that book.</h2><p>${esc(err.message)}</p><a class="btn btn-primary" href="#/">Back to library</a></div>`;
   }
 };
@@ -1456,6 +1324,24 @@ Studio.removeStreamSkeleton = function () {
   if (skel) skel.remove();
 };
 
+// Clear every "still generating" cue after a run ends without a chapter_done
+// (an 'error' terminal, or a defensive sweep on 'done'): the shimmer skeleton,
+// the reader's streaming class/aria-busy, the pulsing words label, and the
+// outline item's spinner. Otherwise a failed run reads as writing forever.
+Studio.stopStreamingUI = function () {
+  const n = Studio.streamingNum;
+  Studio.streamingNum = null;
+  Studio.removeStreamSkeleton();
+  const body = $("#reader-body");
+  if (body) { body.classList.remove("is-streaming"); body.removeAttribute("aria-busy"); }
+  const rw = $("#reader-words");
+  if (rw) rw.classList.remove("is-writing");
+  if (n != null) {
+    const li = $(`#chapter-list .chapter-item[data-num="${n}"]`);
+    if (li) li.classList.remove("is-writing");
+  }
+};
+
 Studio.openChapter = async function (num) {
   Studio.active = num;
   $$("#chapter-list .chapter-item").forEach((li) =>
@@ -1489,12 +1375,17 @@ Studio.openChapter = async function (num) {
     return;
   }
   body.innerHTML = '<div class="sk-line w-80 skeleton"></div><div class="sk-line skeleton"></div><div class="sk-line w-60 skeleton"></div>';
+  const myId = Studio.id, myNum = num;
   try {
-    const ch = await API.chapter(Studio.id, num);
+    const ch = await API.chapter(myId, num);
+    // Stale continuation: the user navigated to another book/chapter while this
+    // one was loading — don't paint old data into the live view.
+    if (Studio.id !== myId || Studio.active !== myNum) return;
     Studio.renderHeaderForChapter(num, { act: (ch.plan && ch.plan.act) || meta.act, title: ch.title, word_count: ch.word_count });
     Studio.renderProse(ch.text, ch.image_url);
     if (acts) acts.hidden = false;  // written → allow Edit / Revise
   } catch (err) {
+    if (Studio.id !== myId || Studio.active !== myNum) return;
     body.innerHTML = `<p class="rail-empty">Couldn't load chapter: ${esc(err.message)}</p>`;
   }
 };
@@ -1667,8 +1558,10 @@ Studio.tickCost = function (snap) {
 
 Studio.renderGraphRail = async function () {
   const castEl = $("#cast-list"), threadEl = $("#thread-list");
+  const myId = Studio.id;
   try {
-    const g = await API.graph(Studio.id);
+    const g = await API.graph(myId);
+    if (Studio.id !== myId) return; // navigated away mid-fetch — don't paint stale data
     Studio._graph = g;
     const cast = (g.characters || []);
     castEl.innerHTML = cast.length ? "" : '<li class="rail-empty">No characters yet.</li>';
@@ -1691,6 +1584,7 @@ Studio.renderGraphRail = async function () {
       threadEl.appendChild(li);
     }
   } catch {
+    if (Studio.id !== myId) return;
     castEl.innerHTML = '<li class="rail-empty">Continuity unavailable.</li>';
     threadEl.innerHTML = "";
   }
@@ -1704,6 +1598,7 @@ Studio.onGenerate = async function () {
   try {
     await API.write(Studio.id, {});
     Studio.running = true;
+    Studio.startedLive = true;   // replayed events for THIS run may follow/celebrate
     toast("Generation started — chapters will stream in live.", { title: "Writing", type: "good" });
     $(".btn-label", btn).textContent = "Writing…";
     // ensure event stream is live (connect is idempotent-ish)
@@ -1711,6 +1606,7 @@ Studio.onGenerate = async function () {
   } catch (err) {
     if (err.status === 409) {
       Studio.running = true;
+      Studio.startedLive = true; // an actual run is in flight — treat as live
       toast("Already running — re-attaching to the live stream.", { type: "info" });
       Studio.connect(true);
       $(".btn-label", btn).textContent = "Writing…";
@@ -1732,8 +1628,14 @@ Studio.connect = function (force) {
     Studio.handleEvent(msg);
   };
   es.onerror = () => {
-    // EventSource auto-reconnects; only surface if we thought we were running.
-    // Leave it; browser retries. No noisy toast.
+    // Reconnect policy: while a run is (or may be) in flight, let the browser's
+    // built-in EventSource retry handle transient drops — no noisy toast. If the
+    // browser gave up for good (readyState CLOSED, e.g. the server answered 204
+    // or a fatal error once the last job finished), drop our handle so a later
+    // Studio.connect() can re-attach cleanly.
+    if (Studio.es === es && es.readyState === EventSource.CLOSED) {
+      Studio.es = null;
+    }
   };
 };
 
@@ -1748,14 +1650,24 @@ Studio.markRunning = function (on) {
 Studio.handleEvent = function (msg) {
   switch (msg.type) {
     case "plan_done":
-      // a fresh plan replaced the bible; refresh shell + rails
+      // a fresh plan replaced the bible; refresh shell + rails. Replayed
+      // history of a finished book carries stale intermediate cost snapshots —
+      // the mount already rendered the final cost, so don't tween backwards.
+      if (!Studio.startedLive && Studio.initiallyComplete) break;
       if (msg.cost) Studio.tickCost(msg.cost);
       break;
 
     case "chapter_start": {
-      Studio.markRunning(true);
+      // A reconnect replays the last job's entire history. If this book was
+      // already fully written when the studio mounted (and this session didn't
+      // start a run itself), ignore replayed writing events entirely — no
+      // button flip, no auto-follow, no blanking the reader pane, and no
+      // streaming buffers: a leftover buffer would shadow the canonical
+      // chapter (image + Edit/Revise included) in openChapter from then on.
+      if (!Studio.startedLive && Studio.initiallyComplete) break;
       Studio.streamingNum = msg.number;
       Studio.buffers[msg.number] = "";
+      Studio.markRunning(true);
       Studio.setChapterStatus(msg.number, "writing");
       srStatus(`Writing chapter ${msg.number}${msg.title ? ": " + msg.title : ""}`);
       // auto-follow the chapter being written
@@ -1777,6 +1689,8 @@ Studio.handleEvent = function (msg) {
     }
 
     case "delta": {
+      // Replayed history of a finished book: ignore (see chapter_start).
+      if (!Studio.startedLive && Studio.initiallyComplete) break;
       const n = msg.number;
       Studio.buffers[n] = (Studio.buffers[n] || "") + (msg.text || "");
       if (Studio.active === n) {
@@ -1795,6 +1709,9 @@ Studio.handleEvent = function (msg) {
     }
 
     case "chapter_done": {
+      // Replayed history of a finished book: the mount already rendered every
+      // chapter as written with the final meta — ignore (see chapter_start).
+      if (!Studio.startedLive && Studio.initiallyComplete) break;
       const n = msg.number;
       Studio.buffers[n] = msg.text || Studio.buffers[n] || "";
       Studio.streamingNum = null;
@@ -1828,8 +1745,10 @@ Studio.handleEvent = function (msg) {
     }
 
     case "manuscript_done": {
+      // Replayed history of an already-finished book: no re-celebration.
+      if (!Studio.startedLive && Studio.initiallyComplete) break;
       if (msg.cost) Studio.tickCost(msg.cost);
-      Studio.markRunning(false);
+      if (Studio.running) Studio.markRunning(false);
       toast(`Manuscript complete — ${fmtInt(msg.words)} words.`, { title: "Done", type: "good" });
       // grand flourish over the hero cover, and an ember pulse on the progress bar
       const cover = $("#studio-cover");
@@ -1840,12 +1759,24 @@ Studio.handleEvent = function (msg) {
     }
 
     case "done":
-      Studio.markRunning(false);
+      if (Studio.running) Studio.markRunning(false);
+      // Defensive sweep: no "still writing" cue should outlive a finished run.
+      Studio.stopStreamingUI();
+      // The server ends the stream after a terminal event; without an explicit
+      // close, EventSource reconnects forever and replays the whole job history
+      // every ~3s. Studio.connect(true) in onGenerate re-attaches for new runs.
+      Studio.disconnect();
       break;
 
     case "error":
-      Studio.markRunning(false);
-      toast(msg.message || "Generation failed.", { title: "Error", type: "error" });
+      if (Studio.running) Studio.markRunning(false);
+      // A mid-chapter failure otherwise leaves the skeleton shimmer, aria-busy,
+      // pulsing words label, and outline spinner stuck in "writing" forever.
+      Studio.stopStreamingUI();
+      Studio.disconnect();
+      if (Studio.startedLive || !Studio.initiallyComplete) {
+        toast(msg.message || "Generation failed.", { title: "Error", type: "error" });
+      }
       break;
   }
 };
@@ -2730,7 +2661,6 @@ function boot() {
   window.srStatus = srStatus;
   initTheme();
   refreshHealth();
-  ensureProfiles();
   // "New book" links open the Create-AI-Book modal in place rather than
   // navigating to a page — without changing the hash (deep-linking #/new still
   // works via the router branch above).

@@ -4,16 +4,19 @@ Two products, one estimate each:
 
   EBOOK — Kindle's 35% vs 70% royalty plans. The 70% plan is only *eligible* when the
   list price is between $2.99 and $9.99 (US); outside that band only 35% is available.
-  The 70% plan also subtracts a per-MB delivery fee (~$0.06/MB in the US). We report the
-  applicable royalty AND the alternate plan so the author can compare.
+  The 70% plan also subtracts a per-MB delivery fee ($0.15/MB on Amazon.com, with a
+  $0.01 minimum). We report the applicable royalty AND the alternate plan so the
+  author can compare.
 
-  PAPERBACK — KDP prints on demand and pays 60% of list price minus a printing cost. The
-  printing cost follows KDP's documented tiered formula (US, B&W, white paper); we encode
-  it as clearly-labelled APPROXIMATE constants (a fixed per-book charge plus a per-page
-  charge above a page threshold). Paperback royalty = 0.60 * list_price - printing_cost,
-  floored at 0.
+  PAPERBACK — KDP prints on demand and pays a percentage of list price minus a
+  printing cost. Since KDP's June 10, 2025 update, US print books earn 50% when the
+  list price is below $9.99 and 60% at or above $9.99. The printing cost follows
+  KDP's published US B&W formula: a flat $2.30 for 24-108 pages, else $1.00 plus
+  $0.012 per TOTAL page (white and cream B&W paper share the same rate).
+  Paperback royalty = rate * list_price - printing_cost, floored at 0.
 
-All money is rounded to cents. These are ESTIMATES — confirm in the KDP UI.
+All money is rounded to cents. These are ESTIMATES against KDP's published rates
+(current as of mid-2025) — confirm in the KDP UI.
 """
 from __future__ import annotations
 
@@ -24,25 +27,26 @@ from typing import Any, Dict, Tuple
 # ---------------------------------------------------------------------------
 EBOOK_70_MIN = 2.99             # inclusive lower bound for 70% eligibility (US)
 EBOOK_70_MAX = 9.99             # inclusive upper bound for 70% eligibility (US)
-DELIVERY_FEE_PER_MB_US = 0.06   # APPROXIMATE US delivery fee on the 70% plan ($/MB)
-MIN_DELIVERY_FEE = 0.0          # KDP has no minimum, but the file is billed in MB
+DELIVERY_FEE_PER_MB_US = 0.15   # Amazon.com delivery fee on the 70% plan ($/MB)
+MIN_DELIVERY_FEE = 0.01         # KDP charges at least $0.01 on the 70% plan
 
 # ---------------------------------------------------------------------------
-# Paperback printing cost — US, B&W ink, white paper. APPROXIMATE; KDP's exact
-# figures change over time, so these are documented constants you can tune.
-#   fixed per-book charge        ~ $1.00
-#   per-page charge ABOVE the    ~ $0.012/page  (pages 1..threshold are "free"
-#     free threshold                under the fixed charge)
-#   free page threshold          110 pages
-# Below ~110 pages KDP charges only the flat fee; above it, the per-page charge
-# applies to every page (this matches KDP's published B&W formula closely enough
-# for a planning estimate).
+# Paperback printing cost — US, B&W ink. KDP's published formula:
+#   24-108 pages   -> flat $2.30 per book (no per-page charge)
+#   110+ pages     -> $1.00 fixed + $0.012 x TOTAL page count
+# White and cream B&W paper cost the same per page in the US. KDP's exact
+# figures change over time; confirm in the KDP UI.
 # ---------------------------------------------------------------------------
-PB_FIXED_COST_US = 1.00
-PB_PER_PAGE_US = 0.012
-PB_FREE_PAGE_THRESHOLD = 110
+PB_SMALL_FLAT_COST_US = 2.30    # flat charge for the 24-108 page tier
+PB_SMALL_MAX_PAGES = 108        # last page count on the flat-fee tier
+PB_LARGE_FIXED_COST_US = 1.00   # fixed charge for 110+ page books...
+PB_LARGE_PER_PAGE_US = 0.012    # ...plus this per TOTAL page
 
-PAPERBACK_ROYALTY_RATE = 0.60   # KDP pays 60% of list price for paperbacks
+# Paperback royalty rate — tiered by US list price since KDP's June 10, 2025
+# update: below $9.99 pays 50%; $9.99 and above pays 60%.
+PAPERBACK_RATE_PRICE_THRESHOLD = 9.99
+PAPERBACK_ROYALTY_RATE_LOW = 0.50    # list price below $9.99
+PAPERBACK_ROYALTY_RATE_HIGH = 0.60   # list price at or above $9.99
 
 
 def _money(x: float) -> float:
@@ -64,16 +68,23 @@ def estimate_page_count(graph, words_per_page: int = 300) -> int:
 
 
 def _paperback_printing_cost(page_count: int, paper: str = "white") -> float:
-    """APPROXIMATE US B&W print cost. Cream costs marginally more per page."""
-    per_page = PB_PER_PAGE_US
-    if (paper or "white").lower() == "cream":
-        per_page = PB_PER_PAGE_US + 0.001  # cream is slightly pricier per page
-    pages_charged = max(0, page_count - PB_FREE_PAGE_THRESHOLD)
-    if page_count <= PB_FREE_PAGE_THRESHOLD:
-        cost = PB_FIXED_COST_US
+    """US B&W print cost per KDP's published formula.
+
+    White and cream B&W paper share the same per-page rate in the US, so
+    ``paper`` does not change the cost (kept for API compatibility).
+    """
+    if page_count <= PB_SMALL_MAX_PAGES:
+        cost = PB_SMALL_FLAT_COST_US
     else:
-        cost = PB_FIXED_COST_US + pages_charged * per_page
+        cost = PB_LARGE_FIXED_COST_US + page_count * PB_LARGE_PER_PAGE_US
     return _money(cost)
+
+
+def _paperback_royalty_rate(price: float) -> float:
+    """Tiered US paperback rate: 50% below $9.99, 60% at or above (June 2025)."""
+    if price >= PAPERBACK_RATE_PRICE_THRESHOLD:
+        return PAPERBACK_ROYALTY_RATE_HIGH
+    return PAPERBACK_ROYALTY_RATE_LOW
 
 
 def estimate_royalties(
@@ -129,28 +140,32 @@ def estimate_royalties(
 
     # ---- PAPERBACK --------------------------------------------------------
     printing_cost = _paperback_printing_cost(pages, paper=paper)
-    pb_royalty = _money(max(0.0, PAPERBACK_ROYALTY_RATE * price - printing_cost))
+    pb_rate = _paperback_royalty_rate(price)
+    pb_royalty = _money(max(0.0, pb_rate * price - printing_cost))
     paperback = {
         "list_price": _money(price),
         "trim": [float(trim[0]), float(trim[1])],
         "paper": (paper or "white").lower(),
         "page_count": pages,
-        "royalty_rate": PAPERBACK_ROYALTY_RATE,
+        "royalty_rate": pb_rate,
         "printing_cost": printing_cost,
         "royalty_per_sale": pb_royalty,
-        "below_cost": (PAPERBACK_ROYALTY_RATE * price) < printing_cost,
+        "below_cost": (pb_rate * price) < printing_cost,
     }
 
     assumptions = [
         f"Marketplace: {marketplace} (figures use US constants).",
         f"Ebook 70% plan eligible only for list price ${EBOOK_70_MIN}-${EBOOK_70_MAX}; "
         f"otherwise 35%.",
-        f"Ebook 70% plan subtracts an APPROXIMATE delivery fee of "
-        f"${DELIVERY_FEE_PER_MB_US}/MB (file ~{mb} MB).",
-        f"Paperback royalty = {PAPERBACK_ROYALTY_RATE:.0%} x list price - printing cost.",
-        f"Printing cost (US, B&W, {(paper or 'white').lower()} paper) APPROXIMATE: "
-        f"${PB_FIXED_COST_US:.2f} fixed + ${PB_PER_PAGE_US}/page above "
-        f"{PB_FREE_PAGE_THRESHOLD} pages.",
+        f"Ebook 70% plan subtracts a delivery fee of ${DELIVERY_FEE_PER_MB_US}/MB "
+        f"(minimum ${MIN_DELIVERY_FEE:.2f}; file ~{mb} MB).",
+        f"Paperback royalty = {pb_rate:.0%} x list price - printing cost "
+        f"({PAPERBACK_ROYALTY_RATE_LOW:.0%} below "
+        f"${PAPERBACK_RATE_PRICE_THRESHOLD}, {PAPERBACK_ROYALTY_RATE_HIGH:.0%} at or "
+        f"above — KDP US rates since June 2025).",
+        f"Printing cost (US, B&W, {(paper or 'white').lower()} paper): "
+        f"${PB_SMALL_FLAT_COST_US:.2f} flat for 24-{PB_SMALL_MAX_PAGES} pages, else "
+        f"${PB_LARGE_FIXED_COST_US:.2f} + ${PB_LARGE_PER_PAGE_US}/page (all pages).",
     ]
 
     return {

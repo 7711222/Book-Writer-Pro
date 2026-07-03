@@ -1,6 +1,8 @@
+import base64
 import io
 import json
 import os
+import re
 import tempfile
 import unittest
 import zipfile
@@ -13,7 +15,13 @@ from bookwriter.pipeline import BookPipeline
 from bookwriter.kdp import (
     KDP_SCHEMA, KdpMetadata, generate_kdp_metadata, build_epub, build_kdp_kit,
     MAX_DESCRIPTION_CHARS, MAX_KEYWORDS, MAX_KEYWORD_CHARS, MAX_CATEGORIES,
-    STORYTELLER_KEYWORD,
+    STORYTELLER_KEYWORD, _lang_code,
+)
+
+# A valid 1x1 PNG (for cover-art embedding tests; no Pillow dependency).
+_TINY_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQ"
+    "DwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
 )
 
 
@@ -226,6 +234,87 @@ class TestEpub(unittest.TestCase):
                                                        cover_svg=svg)))
             self.assertEqual(zf.read("OEBPS/cover.svg").decode("utf-8"), svg)
 
+    def test_control_chars_do_not_corrupt_epub(self):
+        # \x0b (Word soft line break) and friends are XML-1.0-illegal; pasted
+        # prose must not produce an EPUB that Kindle/epubcheck reject.
+        with tempfile.TemporaryDirectory() as tmp:
+            graph, _ = _build_book(tmp)
+            first = sorted(graph.chapters)[0]
+            graph.chapters[first].text = (
+                "Alpha\x0bbeta continues the line.\x0c\x01\x1f"
+                + chr(0xFFFE) + " Clean tail."   # U+FFFE noncharacter
+            )
+            meta = self._meta(graph)
+            meta.subtitle = "A\x0bSubtitle"
+            zf = zipfile.ZipFile(io.BytesIO(build_epub(graph, meta)))
+            for name in zf.namelist():
+                if name == "mimetype" or name.endswith(".css"):
+                    continue
+                raw = zf.read(name)
+                minidom.parseString(raw)  # raises on malformed XML
+                self.assertNotIn(b"\x0b", raw, name)
+            chap = zf.read(f"OEBPS/chap-{1:02d}.xhtml").decode("utf-8")
+            # \x0b became a space: both halves survive, unglued
+            self.assertIn("Alpha beta", chap)
+            self.assertIn("Clean tail.", chap)
+
+    def test_language_maps_to_bcp47(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            graph, _ = _build_book(tmp)
+            meta = self._meta(graph)
+            meta.language = "Spanish"
+            zf = zipfile.ZipFile(io.BytesIO(build_epub(graph, meta)))
+            opf = zf.read("OEBPS/content.opf").decode("utf-8")
+            self.assertIn("<dc:language>es</dc:language>", opf)
+            self.assertIn('xml:lang="es"', opf)
+            chap = zf.read("OEBPS/chap-01.xhtml").decode("utf-8")
+            self.assertIn('lang="es"', chap)
+            self.assertNotIn('xml:lang="en"', chap)
+
+    def test_lang_code_mapping(self):
+        self.assertEqual(_lang_code("English"), "en")
+        self.assertEqual(_lang_code("spanish"), "es")
+        self.assertEqual(_lang_code("Japanese"), "ja")
+        self.assertEqual(_lang_code("pt"), "pt")     # bare code passes through
+        self.assertEqual(_lang_code("Klingon"), "en")  # unknown -> en
+        self.assertEqual(_lang_code(""), "en")
+
+    def test_dcterms_modified_is_real_and_overridable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            graph, _ = _build_book(tmp)
+            meta = self._meta(graph)
+            # explicit override (deterministic builds)
+            zf = zipfile.ZipFile(io.BytesIO(
+                build_epub(graph, meta, modified="2020-05-05T00:00:00Z")))
+            opf = zf.read("OEBPS/content.opf").decode("utf-8")
+            self.assertIn(
+                '<meta property="dcterms:modified">2020-05-05T00:00:00Z</meta>', opf)
+            # default: a real UTC timestamp, not the old frozen constant
+            zf2 = zipfile.ZipFile(io.BytesIO(build_epub(graph, meta)))
+            opf2 = zf2.read("OEBPS/content.opf").decode("utf-8")
+            m = re.search(
+                r'<meta property="dcterms:modified">([^<]+)</meta>', opf2)
+            self.assertIsNotNone(m)
+            stamp = m.group(1)
+            self.assertRegex(stamp, r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+            self.assertNotEqual(stamp, "2026-01-01T00:00:00Z")
+
+    def test_art_embedded_as_raster_cover_image(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            graph, _ = _build_book(tmp)
+            zf = zipfile.ZipFile(io.BytesIO(build_epub(
+                graph, self._meta(graph), art_bytes=_TINY_PNG, art_ext="png")))
+            names = zf.namelist()
+            self.assertIn("OEBPS/cover.png", names)
+            self.assertNotIn("OEBPS/cover.svg", names)
+            self.assertEqual(zf.read("OEBPS/cover.png"), _TINY_PNG)
+            opf = zf.read("OEBPS/content.opf").decode("utf-8")
+            self.assertIn('href="cover.png" media-type="image/png" '
+                          'properties="cover-image"', opf)
+            cover = zf.read("OEBPS/cover.xhtml").decode("utf-8")
+            self.assertIn('src="cover.png"', cover)
+            self.assertNotIn("cover.svg", cover)
+
 
 class TestKit(unittest.TestCase):
     def test_kit_writes_all_files(self):
@@ -264,6 +353,65 @@ class TestKit(unittest.TestCase):
             self.assertIn("manuscript.epub", checklist)
             self.assertIn("ISBN", checklist)
             self.assertIn(STORYTELLER_KEYWORD, checklist)
+            # KDP rejects SVG covers — the checklist must never say to upload one
+            self.assertNotIn("upload `cover.svg`", checklist)
+            self.assertIn("KDP does NOT accept SVG", checklist)
+
+    def _kit_meta(self, graph):
+        return KdpMetadata(
+            title=graph.bible.title or "Test Book",
+            author_first="Jane", author_last="Doe",
+            description="A blurb.", keywords=["k1"], categories=["c1"],
+        )
+
+    def test_kit_with_art_writes_raster_cover(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            graph, _ = _build_book(tmp)
+            out = os.path.join(tmp, "kdp")
+            result = build_kdp_kit(graph, self._kit_meta(graph), out,
+                                   art_bytes=_TINY_PNG, art_ext="png")
+            paths = result["paths"]
+            # the raster cover is copied into the kit...
+            self.assertIn("cover_image", paths)
+            self.assertTrue(paths["cover_image"].endswith("cover.png"))
+            with open(paths["cover_image"], "rb") as f:
+                self.assertEqual(f.read(), _TINY_PNG)
+            # ...embedded directly in the EPUB (no base64-inflated SVG cover)...
+            with open(paths["epub"], "rb") as f:
+                zf = zipfile.ZipFile(io.BytesIO(f.read()))
+            self.assertIn("OEBPS/cover.png", zf.namelist())
+            self.assertNotIn("OEBPS/cover.svg", zf.namelist())
+            # ...and the checklist points at it, not at the SVG
+            with open(paths["checklist"], encoding="utf-8") as f:
+                checklist = f.read()
+            self.assertIn("cover.png", checklist)
+            self.assertNotIn("upload `cover.svg`", checklist)
+
+    def test_kit_discovers_cover_art_on_disk(self):
+        # generate-cover saves kdp/cover-art.<ext>; the kit picks it up without
+        # the caller passing bytes.
+        with tempfile.TemporaryDirectory() as tmp:
+            graph, _ = _build_book(tmp)
+            out = os.path.join(tmp, "kdp")
+            os.makedirs(out, exist_ok=True)
+            with open(os.path.join(out, "cover-art.png"), "wb") as f:
+                f.write(_TINY_PNG)
+            result = build_kdp_kit(graph, self._kit_meta(graph), out)
+            self.assertIn("cover_image", result["paths"])
+            with open(result["paths"]["epub"], "rb") as f:
+                zf = zipfile.ZipFile(io.BytesIO(f.read()))
+            self.assertIn("OEBPS/cover.png", zf.namelist())
+            self.assertEqual(zf.read("OEBPS/cover.png"), _TINY_PNG)
+
+    def test_kit_without_art_keeps_svg_cover(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            graph, _ = _build_book(tmp)
+            out = os.path.join(tmp, "kdp")
+            result = build_kdp_kit(graph, self._kit_meta(graph), out)
+            self.assertNotIn("cover_image", result["paths"])
+            with open(result["paths"]["epub"], "rb") as f:
+                zf = zipfile.ZipFile(io.BytesIO(f.read()))
+            self.assertIn("OEBPS/cover.svg", zf.namelist())
 
 
 if __name__ == "__main__":

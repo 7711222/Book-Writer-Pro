@@ -18,6 +18,6 @@ Token-cost minimization is the central design constraint. See ``costs.py`` and
 the README for the full accounting.
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 from .config import Settings, QUALITY_PROFILES  # noqa: E402,F401

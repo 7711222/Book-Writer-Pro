@@ -50,6 +50,18 @@ def build_bible(d: Dict[str, Any]) -> Bible:
         outline=[ChapterPlan.from_dict(x) for x in d.get("outline", [])],
     )
     bible.outline.sort(key=lambda p: p.number)
+    if not bible.outline:
+        # complete_json returns {} for an empty/refused response; without this
+        # guard the "plan" would persist and write_all would finish instantly
+        # with an empty manuscript instead of surfacing the failure.
+        raise ValueError("planner returned no chapters")
+    # Renumber sequentially: the json_object provider path can't structurally
+    # enforce the schema, so chapter numbers may be missing (coerced to 0) or
+    # duplicated — which would make bible.plan(n) ambiguous and break the
+    # writer's is-last check. Order (after the sort above) is authoritative.
+    for i, p in enumerate(bible.outline, 1):
+        p.number = i
+    bible.target_chapters = len(bible.outline)
     return bible
 
 

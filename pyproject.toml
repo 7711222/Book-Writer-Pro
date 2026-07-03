@@ -1,20 +1,20 @@
 [build-system]
-requires = ["setuptools>=68"]
+# >=77 for the SPDX license-expression string form below.
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "bookwriterpro"
-version = "1.0.0"
+version = "1.1.0"
 description = "Token-cost-optimized local book generation with a continuity knowledge graph."
 readme = "README.md"
-license = { text = "MIT" }
+license = "MIT"
 requires-python = ">=3.10"
 authors = [{ name = "Valentino", email = "valentinohelp@gmail.com" }]
 keywords = ["ai", "book-generation", "llm", "anthropic", "claude", "mcp", "kdp", "writing"]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Intended Audience :: End Users/Desktop",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
@@ -49,3 +49,13 @@ include-package-data = true
 [tool.setuptools.package-data]
 # Recursive so any future web/ subdir (assets, fonts) ships too.
 bookwriter = ["web/**/*"]
+
+[tool.pytest.ini_options]
+# Only collect tests/ (never a stale build/lib tree), and pin the future
+# pytest-asyncio fixture-loop-scope default explicitly so every run isn't
+# prefixed with its PytestDeprecationWarning. The suite is unittest-style with
+# no async fixtures, so "function" is a safe no-op today. (The option is
+# registered by the pytest-asyncio plugin; without it installed, pytest emits
+# a harmless "Unknown config option" notice — CI installs it in both jobs.)
+testpaths = ["tests"]
+asyncio_default_fixture_loop_scope = "function"

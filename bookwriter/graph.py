@@ -48,19 +48,24 @@ class StateDelta:
     @classmethod
     def from_dict(cls, chapter: int, d: Dict[str, Any]) -> "StateDelta":
         # Coerce off-spec model output at the boundary: the dict-list fields keep
-        # only dict entries and the string-list fields keep only strings, so
-        # apply_delta never meets a bare string where it expects an object.
+        # only dict entries, the string-list fields keep only strings, and the
+        # string scalars drop non-strings (a model-emitted number would otherwise
+        # crash record_chapter's .strip()), so apply_delta never meets a bare
+        # string where it expects an object or vice versa.
         def _dicts(v):
             return [x for x in v if isinstance(x, dict)] if isinstance(v, list) else []
 
         def _strs(v):
             return [x for x in v if isinstance(x, str)] if isinstance(v, list) else []
 
+        def _str(v):
+            return v if isinstance(v, str) else ""
+
         return cls(
             chapter=chapter,
-            synopsis_line=d.get("synopsis_line", "") or "",
-            timeline_summary=d.get("timeline_summary", "") or "",
-            time_marker=d.get("time_marker", "") or "",
+            synopsis_line=_str(d.get("synopsis_line")),
+            timeline_summary=_str(d.get("timeline_summary")),
+            time_marker=_str(d.get("time_marker")),
             character_updates=_dicts(d.get("character_updates")),
             new_characters=_dicts(d.get("new_characters")),
             new_locations=_dicts(d.get("new_locations")),
@@ -153,12 +158,12 @@ class StoryGraph:
 
         dyn_lines = []
         for c in b.characters:
-            if c.id not in ids:
-                continue
             if c.first_chapter is not None:
-                # discovered mid-book -> not in the frozen prefix; give full identity
+                # Discovered mid-book -> not in the frozen prefix; give full
+                # identity even when absent from the planned cast (the outline
+                # predates the discovery, so plan.character_ids can't list them).
                 dyn_lines.append(c.card())
-            else:
+            elif c.id in ids:
                 d = c.dynamic_card()
                 if d:
                     dyn_lines.append(d)
@@ -171,6 +176,11 @@ class StoryGraph:
         if new_locs:
             out.append("\n## Locations established mid-book")
             out.extend(l.card() for l in new_locs)
+
+        new_items = [i for i in b.items if i.first_chapter is not None]
+        if new_items:
+            out.append("\n## Items discovered mid-book")
+            out.extend(i.card() for i in new_items)
 
         open_threads = [t for t in b.threads if t.status == "open"]
         if open_threads:
@@ -198,6 +208,12 @@ class StoryGraph:
         if locs:
             out.append("\n## Locations in this chapter")
             out.extend(l.card() for l in locs)
+        if b.items:
+            # All items, always: the cards are one-liners, and the extractor is
+            # told to report "anything not already in the bible" — without this
+            # it re-reports the same item every chapter under variant id slugs.
+            out.append("\n## Items")
+            out.extend(i.card() for i in b.items)
         open_threads = [t for t in b.threads if t.status == "open"]
         if open_threads:
             out.append("\n## Open plot threads")

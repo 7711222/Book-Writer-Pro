@@ -9,8 +9,8 @@
 A local‑first book‑generation studio with a sleek, modern UI, an HTTP API, and a Model‑Context‑Protocol server — so a human *or an AI agent* can use it as a tool.
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)
-![Tests](https://img.shields.io/badge/tests-191%20passing-2ea44f)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![CI](https://github.com/RealDealCPA-VR/BookwritterPro/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/RealDealCPA-VR/BookwritterPro/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](https://github.com/RealDealCPA-VR/BookwritterPro/blob/main/LICENSE)
 ![MCP](https://img.shields.io/badge/MCP-24%20tools-7c3aed)
 ![KDP](https://img.shields.io/badge/Amazon%20KDP-fast%20publish-FF9900?logo=amazon&logoColor=white)
 ![Build](https://img.shields.io/badge/build-none%20%C2%B7%20vanilla%20JS-orange)
@@ -24,7 +24,7 @@ A local‑first book‑generation studio with a sleek, modern UI, an HTTP API, a
 
 <div align="center">
 
-![The Library](docs/screenshots/library-light.png)
+![The Library](https://raw.githubusercontent.com/RealDealCPA-VR/BookwritterPro/main/docs/screenshots/library-light.png)
 
 *A bookshelf you actually want to browse — every cover is generated, not stock.*
 
@@ -34,7 +34,7 @@ A local‑first book‑generation studio with a sleek, modern UI, an HTTP API, a
 
 ### 🪄 Your book cover designs itself as you type
 
-![Live cover forge](docs/screenshots/cover-forge.gif)
+![Live cover forge](https://raw.githubusercontent.com/RealDealCPA-VR/BookwritterPro/main/docs/screenshots/cover-forge.gif)
 
 *No stock art, no upload — a real procedural jacket forged live in the browser.*
 
@@ -61,9 +61,9 @@ Most "AI writer" apps give you a chat box and a wall of text. BookwriterPro give
 
 | Watch chapters stream live | Light *and* dark, both first‑class |
 |---|---|
-| ![Live streaming studio](docs/screenshots/studio-streaming.png) | ![Dark mode library](docs/screenshots/library-dark.png) |
+| ![Live streaming studio](https://raw.githubusercontent.com/RealDealCPA-VR/BookwritterPro/main/docs/screenshots/studio-streaming.png) | ![Dark mode library](https://raw.githubusercontent.com/RealDealCPA-VR/BookwritterPro/main/docs/screenshots/library-dark.png) |
 | **Read it like a real book** | **Trace the story's web** |
-| ![3D page-turn reader](docs/screenshots/manuscript-reader.png) | ![Character graph](docs/screenshots/graph-focus.png) |
+| ![3D page-turn reader](https://raw.githubusercontent.com/RealDealCPA-VR/BookwritterPro/main/docs/screenshots/manuscript-reader.png) | ![Character graph](https://raw.githubusercontent.com/RealDealCPA-VR/BookwritterPro/main/docs/screenshots/graph-focus.png) |
 
 </div>
 
@@ -120,6 +120,10 @@ python -m bookwriter.serve
 
 The subscription backends shell out to each vendor's signed‑in CLI, so generation rides your **flat monthly plan** — the live cost meter reads **$0/token** for those, and the prose stages honor the exact model you pick while the cheap continuity stages stay cheap.
 
+Two knobs tune the CLI backends: `BOOKWRITER_CLI_TIMEOUT` caps a hung CLI subprocess (seconds, default 600 — a CLI stuck on an interactive login prompt is killed instead of hanging a write job), and for argv‑only CLIs a `{promptfile}` placeholder in the command is replaced with the path of a temp file holding the prompt (e.g. `BOOKWRITER_GROK_CMD=grok --prompt-file {promptfile}`) — argv prompts are capped by the OS command line, ~32 KB on Windows.
+
+> The non‑Anthropic **API** backends (`openai`, `openrouter`, `grok`) use the OpenAI client library under the hood — install it with `pip install -e ".[openai]"`.
+
 ---
 
 ## 🎨 Illustrated chapters
@@ -137,6 +141,8 @@ export BOOKWRITER_IMAGE_PROVIDER=http          # ANY HTTP image API (set BOOKWRI
 
 Image generation is **best‑effort**: if a key is missing or a call fails, the chapter is written without an image — never blocking your prose.
 
+The `http` provider refuses private/loopback endpoints by default (an SSRF guard) — set `BOOKWRITER_IMAGE_ALLOW_PRIVATE=1` to opt in for a local backend like ComfyUI.
+
 ---
 
 ## 🤖 Use it as an agent tool (MCP)
@@ -152,7 +158,7 @@ python -m bookwriter.mcp_server     # stdio MCP server
 
 `list_profiles` · `list_books` · `create_book` · `import_book` · `write_book` · `write_chapter` · `edit_chapter` · `revise_chapter` · `add_chapters` · `get_status` · `get_chapter` · `get_graph` · `get_cost` · `get_manuscript` · `prepare_kdp` · `export_epub` · `export_docx` · `print_spec` · `estimate_royalties` · `generate_marketing` · `get_kdp_listing` · `generate_cover` · `generate_back_cover` · `export_pdf`
 
-Claude Desktop config and details: **[`docs/MCP.md`](docs/MCP.md)**.
+Claude Desktop config and details: **[`docs/MCP.md`](https://github.com/RealDealCPA-VR/BookwritterPro/blob/main/docs/MCP.md)**.
 
 Prefer plain HTTP? The same engine is a **FastAPI/OpenAPI** service with live **Server‑Sent Events** streaming — interactive docs at **`/docs`** when the server is running.
 
@@ -181,7 +187,7 @@ Generation is **resumable** — it saves after every chapter, so an interrupted 
 
 <div align="center">
 
-![Publish to KDP](docs/screenshots/publish.png)
+![Publish to KDP](https://raw.githubusercontent.com/RealDealCPA-VR/BookwritterPro/main/docs/screenshots/publish.png)
 
 </div>
 
@@ -244,7 +250,7 @@ premise ──▶ Planner ──▶ Story Bible + Continuity Graph  (committed J
   Continuity Checker ──▶ flags
 ```
 
-Three surfaces over one engine: a **vanilla, no‑build web SPA**, a **FastAPI HTTP/SSE API**, and an **MCP server**. Full write‑up in **[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)**.
+Three surfaces over one engine: a **vanilla, no‑build web SPA**, a **FastAPI HTTP/SSE API**, and an **MCP server**. Full write‑up in **[`docs/ARCHITECTURE.md`](https://github.com/RealDealCPA-VR/BookwritterPro/blob/main/docs/ARCHITECTURE.md)**.
 
 ---
 
@@ -262,6 +268,7 @@ BookwriterPro is **local‑first and single‑user by design** — it ships no a
   Only do this **behind a reverse proxy that adds authentication and TLS** — anyone who can reach the app can spend your tokens, read/change settings, and delete books.
 - **Run a single process.** Live state (the SSE broker, the one‑job‑per‑book lock, the settings store) lives in memory, so do **not** run multiple uvicorn/gunicorn workers — they'd split that state. Scale by running one process per user, not one process with N workers.
 - **Secrets stay local.** API keys entered in **Settings** are written to `<data_dir>/settings.json` (`.bookwriter_data/`, git‑ignored), masked in the API, and never logged or returned in full. On a shared host, lock down the data dir's permissions.
+- **Saved keys are plaintext on disk.** Keys saved from the Settings panel land as plaintext JSON at `<data_dir>/settings.json`, restricted to the current user (`chmod 600` on POSIX, an `icacls` owner‑only ACL on Windows).
 - **Requests are bounded** (chapter count, words/chapter, premise length) so a single call can't trigger runaway spend, and chapter prose is persisted **before** the cheap continuity stages run, so a bad model response never discards a paid‑for chapter — interrupted runs resume cleanly.
 - **Logging:** set `BOOKWRITER_LOG_LEVEL=DEBUG` for verbose server logs (default `INFO`). Background write‑job failures are always logged with a full traceback.
 
@@ -271,7 +278,7 @@ BookwriterPro is **local‑first and single‑user by design** — it ships no a
 | `BOOKWRITER_ALLOW_REMOTE` | unset | required to bind a non‑local host |
 | `BOOKWRITER_DATA_DIR` | `./.bookwriter_data` | where books + `settings.json` live |
 | `BOOKWRITER_LOG_LEVEL` | `INFO` | server log verbosity |
-| `BOOKWRITER_LLM_PROVIDER` | `anthropic` | default backend (`anthropic`/`openai`/`openrouter`/`claude-cli`/`codex`/`grok-cli`/`cli`) |
+| `BOOKWRITER_LLM_PROVIDER` | `anthropic` | default backend (`anthropic`/`openai`/`openrouter`/`grok`/`claude-cli`/`codex`/`grok-cli`/`cli`) |
 
 Install with capped, reproducible dependencies; for a locked deploy, layer a `pip freeze` constraints file on top of the floors in `requirements*.txt`.
 
@@ -280,10 +287,10 @@ Install with capped, reproducible dependencies; for a locked deploy, layer a `pi
 ## 🧪 Tested & solid
 
 ```bash
-python -m pytest -q                       # 191 tests, runs fully offline (mock model)
+python -m pytest -q                       # the full offline suite (mock model, no network)
 ```
 
-The whole package imports and its test suite runs with **zero third‑party installs** (the LLM client is mockable). Server/MCP tests skip cleanly if those extras aren't installed.
+The whole package imports and its test suite runs with **zero third‑party installs** (the LLM client is mockable). Server/MCP tests skip cleanly if those extras aren't installed. [CI](https://github.com/RealDealCPA-VR/BookwritterPro/actions/workflows/ci.yml) runs the suite on every push — a no‑extras pass (server/MCP/PDF tests skip cleanly) and a full pass with every extra installed, on Ubuntu and Windows across Python 3.10 and 3.13. Release history lives in [`CHANGELOG.md`](https://github.com/RealDealCPA-VR/BookwritterPro/blob/main/CHANGELOG.md).
 
 ---
 
@@ -301,7 +308,7 @@ bookwriter/
   mcp_server.py  MCP stdio server (24 tools)
   web/           the studio UI (index.html, styles.css, app.js, covers.js, palette.js, kdp.js)
 docs/            ARCHITECTURE.md · MCP.md · screenshots/
-tests/           191 offline tests
+tests/           the offline test suite (mock model — no keys, no network)
 ```
 
 ---
@@ -311,14 +318,15 @@ tests/           191 offline tests
 | What | How |
 |---|---|
 | Real generation | `ANTHROPIC_API_KEY` (else Demo/mock mode) |
-| LLM backend | `BOOKWRITER_LLM_PROVIDER` — `anthropic` (default) · `openai` · `openrouter` · `claude-cli` · `codex` · `grok-cli` |
+| LLM backend | `BOOKWRITER_LLM_PROVIDER` — `anthropic` (default) · `openai` · `openrouter` · `grok` · `claude-cli` · `codex` · `grok-cli` · `cli` |
 | Per‑tier models | `BOOKWRITER_MODEL_STRONG` / `_MID` / `_CHEAP` (for non‑Anthropic backends) |
 | Chapter images | `BOOKWRITER_IMAGE_PROVIDER` — `pixio` (default, `PIXIO_API_KEY`) · `openai` · `http` |
 | Where books live | `BOOKWRITER_DATA_DIR` (default `./.bookwriter_data`) |
 | Server host/port | `BOOKWRITER_HOST` / `BOOKWRITER_PORT` (default `127.0.0.1:8000`) |
 | Quality profile | `premium` · `balanced` (default) · `draft` — `bookwriter profiles` |
+| `.env` file | Auto‑loaded from the directory you run in (CLI and `python -m bookwriter.serve`), or point `BOOKWRITER_ENV_FILE` elsewhere; shell‑exported variables always win |
 
-> See [`.env.example`](.env.example) for every knob — provider keys, subscription‑CLI commands, and image‑provider settings.
+> See [`.env.example`](https://github.com/RealDealCPA-VR/BookwritterPro/blob/main/.env.example) for every knob — provider keys, subscription‑CLI commands, and image‑provider settings. Copy it to `.env` and it is loaded automatically; every value ships commented out, so a verbatim copy changes nothing.
 
 ---
 

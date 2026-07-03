@@ -1,0 +1,55 @@
+# Continuous integration for BookwriterPro.
+#
+# Two jobs, mirroring the layering rule in docs/ARCHITECTURE.md:
+#
+#   core — bare `pip install -e .` plus only the test toolchain (pytest +
+#          pytest-asyncio, which [tool.pytest.ini_options] configures). No
+#          extras installed: continuously proves the offline suite passes on a
+#          minimal install, with the server/MCP/PDF tests skipping cleanly
+#          when those extras are absent.
+#
+#   full — all extras (".[server,mcp,pdf,openai]") plus pytest and
+#          pytest-asyncio, so the server/MCP/PDF tests run too, on Ubuntu and
+#          Windows across Python 3.10 and 3.13.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  core:
+    name: core py${{ matrix.python-version }} (no extras)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install (core package + test toolchain, no extras)
+        run: python -m pip install -e . pytest pytest-asyncio
+      - name: Run the offline suite (server/MCP/PDF tests skip cleanly)
+        run: python -m pytest -q
+
+  full:
+    name: full ${{ matrix.os }} py${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install with all extras
+        run: python -m pip install -e ".[server,mcp,pdf,openai]" pytest pytest-asyncio
+      - name: Run the full offline suite
+        run: python -m pytest -q

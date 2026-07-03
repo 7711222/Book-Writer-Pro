@@ -1,6 +1,6 @@
 # Ensure the static web app ships in the sdist (wheel data is covered by
 # [tool.setuptools.package-data] in pyproject.toml).
 recursive-include bookwriter/web *
-include README.md LICENSE .env.example
+include README.md CHANGELOG.md LICENSE .env.example
 include requirements.txt requirements-server.txt
 recursive-include docs *.md

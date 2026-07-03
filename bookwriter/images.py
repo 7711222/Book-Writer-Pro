@@ -20,10 +20,13 @@ is best-effort and never blocks the prose.
 from __future__ import annotations
 
 import base64
+import ipaddress
 import json
 import os
+import socket
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Optional, Tuple
 
@@ -113,20 +116,86 @@ def make_image_provider(provider: Optional[str] = None) -> "ImageProvider":
 # Small HTTP helpers (stdlib only)
 # --------------------------------------------------------------------------- #
 
-def _request(method: str, url: str, *, headers: dict, data: Optional[bytes] = None,
-             timeout: float = 60.0) -> Tuple[int, bytes]:
-    # Only ever speak http(s). A custom/compromised image endpoint could return a
-    # file:// (or other-scheme) URL that urllib would happily open and we'd save as
-    # a "chapter image" — refuse anything but http/https.
-    scheme = urllib.parse.urlparse(url).scheme.lower()
+# Hard cap on any response body read from an image endpoint — a hostile or
+# misconfigured endpoint must not be able to exhaust memory mid-write.
+MAX_FETCH_BYTES = 25 * 1024 * 1024
+
+
+def _allow_private() -> bool:
+    return (rc.getenv("BOOKWRITER_IMAGE_ALLOW_PRIVATE") or "").strip().lower() \
+        in ("1", "true", "yes", "on")
+
+
+def _check_url(url: str) -> None:
+    """Refuse anything but http(s) and, unless the user opts in, hosts that
+    resolve to private/loopback/link-local addresses.
+
+    Both the endpoint (BOOKWRITER_IMAGE_URL) and the image URL its response
+    points at are settings-controlled, so without this check the server could
+    be steered at cloud metadata (169.254.169.254) or intranet hosts (SSRF) —
+    or handed a file:// URL we'd save as a "chapter image".
+    """
+    parsed = urllib.parse.urlparse(url)
+    scheme = parsed.scheme.lower()
     if scheme not in ("http", "https"):
         raise RuntimeError(f"Refusing non-http(s) image URL: {url!r}")
+    if _allow_private():
+        return
+    host = parsed.hostname or ""
+    port = parsed.port or (443 if scheme == "https" else 80)
+    try:
+        infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+    except OSError as e:
+        raise RuntimeError(f"Could not resolve image host {host!r}: {e}") from e
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if not ip.is_global:
+            raise RuntimeError(
+                f"Refusing image URL {url!r}: host resolves to a private/internal "
+                f"address ({ip}). Set BOOKWRITER_IMAGE_ALLOW_PRIVATE=1 to allow "
+                f"local/intranet image endpoints."
+            )
+
+
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Re-validate every redirect target — even a 'trusted' endpoint could 302
+    to file:// or an internal address otherwise."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _check_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_opener = urllib.request.build_opener(_SafeRedirectHandler)
+
+
+def _read_capped(resp, url: str) -> bytes:
+    """Read a response body, aborting past MAX_FETCH_BYTES (unbounded-read DoS)."""
+    cap = MAX_FETCH_BYTES
+    length = (resp.headers.get("Content-Length") or "").strip()
+    if length.isdigit() and int(length) > cap:
+        raise RuntimeError(
+            f"Response from {url} declares {int(length):,} bytes — over the "
+            f"{cap // (1024 * 1024)} MB image cap."
+        )
+    body = resp.read(cap + 1)
+    if len(body) > cap:
+        raise RuntimeError(
+            f"Response from {url} exceeded the {cap // (1024 * 1024)} MB image cap."
+        )
+    return body
+
+
+def _request(method: str, url: str, *, headers: dict, data: Optional[bytes] = None,
+             timeout: float = 60.0) -> Tuple[int, bytes]:
+    _check_url(url)
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.getcode(), resp.read()
+        with _opener.open(req, timeout=timeout) as resp:
+            return resp.getcode(), _read_capped(resp, url)
     except urllib.error.HTTPError as e:
-        return e.code, e.read()
+        # Error bodies are only ever used for short diagnostics — cap likewise.
+        return e.code, e.read(65536)
 
 
 def _get_json(url: str, headers: dict, timeout: float = 60.0):

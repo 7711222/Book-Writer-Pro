@@ -45,12 +45,40 @@ SPINE_IN_PER_PAGE_CREAM = 0.0025
 WORDS_PER_PAGE_6x9 = 300        # rough trade-paperback density at 6x9
 MIN_PAGE_COUNT = 24             # KDP's paperback page-count floor
 
+# KDP's minimum INSIDE (gutter) margin grows with page count (no-bleed interiors):
+#   24-150 pages: 0.375"    151-300: 0.5"    301-500: 0.625"
+#   501-700: 0.75"          700+:    0.875"
+# We emit it as sectPr w:gutter (extra inside space) with mirrorMargins so it
+# rides the binding edge on facing pages.
+_GUTTER_TIERS = ((150, 0.375), (300, 0.5), (500, 0.625), (700, 0.75))
+GUTTER_MAX_IN = 0.875
+
+
+def _gutter_in(page_count: int) -> float:
+    """KDP inside-margin (gutter) minimum for an estimated page count."""
+    for max_pages, gutter in _GUTTER_TIERS:
+        if page_count <= max_pages:
+            return gutter
+    return GUTTER_MAX_IN
+
 
 # ---------------------------------------------------------------------------
 # Shared text helpers (mirror kdp.py's paragraph splitting so prose is preserved)
 # ---------------------------------------------------------------------------
+# XML 1.0 forbids most C0 control characters; a pasted \x0b or \x0c (Word soft
+# breaks) would make Word reject the .docx. Translate them away before escaping:
+# \x0b/\x0c become spaces, the rest (except \t \n \r) are dropped, as are the
+# ￾/￿ noncharacters (also outside XML 1.0's Char range).
+_XML_CTRL_TRANSLATE = str.maketrans({
+    **{c: None for c in range(0x20) if c not in (0x09, 0x0A, 0x0D)},
+    0x0B: " ", 0x0C: " ", 0x7F: None, 0xFFFE: None, 0xFFFF: None,
+})
+
+
 def _esc(text: Any) -> str:
-    return _xml_escape(str(text if text is not None else ""))
+    return _xml_escape(
+        str(text if text is not None else "").translate(_XML_CTRL_TRANSLATE)
+    )
 
 
 def _paragraphs(text: str) -> List[str]:
@@ -74,6 +102,13 @@ def _book_word_count(graph) -> int:
             wc = len(rec.text.split())
         total += wc
     return total
+
+
+def _estimate_page_count(graph) -> int:
+    """Shared page-count estimate (words / trade density, KDP 24-page floor)."""
+    words = _book_word_count(graph)
+    return max(MIN_PAGE_COUNT,
+               int(round(words / WORDS_PER_PAGE_6x9)) or MIN_PAGE_COUNT)
 
 
 # ===========================================================================
@@ -104,6 +139,10 @@ def _CONTENT_TYPES() -> str:
         'ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
         '<Override PartName="/word/styles.xml" '
         'ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>'
+        '<Override PartName="/word/footer1.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml"/>'
+        '<Override PartName="/word/settings.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml"/>'
         '</Types>'
     )
 
@@ -126,7 +165,38 @@ def _DOC_RELS() -> str:
         '<Relationship Id="rId1" '
         'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" '
         'Target="styles.xml"/>'
+        '<Relationship Id="rId2" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer" '
+        'Target="footer1.xml"/>'
+        '<Relationship Id="rId3" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/settings" '
+        'Target="settings.xml"/>'
         '</Relationships>'
+    )
+
+
+def _FOOTER() -> str:
+    """word/footer1.xml — a centered PAGE-number field on every page."""
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        '<w:ftr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        '<w:p><w:pPr><w:jc w:val="center"/></w:pPr>'
+        '<w:r><w:fldChar w:fldCharType="begin"/></w:r>'
+        '<w:r><w:instrText xml:space="preserve"> PAGE </w:instrText></w:r>'
+        '<w:r><w:fldChar w:fldCharType="separate"/></w:r>'
+        '<w:r><w:t>1</w:t></w:r>'
+        '<w:r><w:fldChar w:fldCharType="end"/></w:r>'
+        '</w:p></w:ftr>'
+    )
+
+
+def _SETTINGS() -> str:
+    """word/settings.xml — mirror margins so the gutter rides the inside edge."""
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        '<w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        '<w:mirrorMargins/>'
+        '</w:settings>'
     )
 
 
@@ -164,18 +234,23 @@ def build_docx(graph, meta, *, trim=(6.0, 9.0)) -> bytes:
     Layout: title page (title/subtitle/author) -> copyright page -> each chapter on
     a new page (page break before the chapter heading), with a Heading1 chapter title
     and prose split into paragraphs on blank lines. Page size is the trim in twips via
-    a section's pgSz; margins are 1 inch. Chapter prose is never dropped.
+    a section's pgSz; margins are 1 inch plus a KDP-sized inside gutter (mirrored
+    via settings.xml so it rides the binding edge), and a centered page-number
+    footer prints on every page. Chapter prose is never dropped.
     """
     trim_w, trim_h = float(trim[0]), float(trim[1])
     pg_w = int(round(trim_w * TWIPS_PER_INCH))
     pg_h = int(round(trim_h * TWIPS_PER_INCH))
     margin = int(round(MARGIN_IN * TWIPS_PER_INCH))
+    # Inside (gutter) margin sized from the estimated page count, per KDP's table.
+    gutter = int(round(_gutter_in(_estimate_page_count(graph)) * TWIPS_PER_INCH))
 
     sect_pr = (
         '<w:sectPr>'
+        '<w:footerReference w:type="default" r:id="rId2"/>'
         f'<w:pgSz w:w="{pg_w}" w:h="{pg_h}"/>'
         f'<w:pgMar w:top="{margin}" w:right="{margin}" w:bottom="{margin}" '
-        f'w:left="{margin}" w:header="720" w:footer="720" w:gutter="0"/>'
+        f'w:left="{margin}" w:header="720" w:footer="720" w:gutter="{gutter}"/>'
         '</w:sectPr>'
     )
 
@@ -210,7 +285,8 @@ def build_docx(graph, meta, *, trim=(6.0, 9.0)) -> bytes:
 
     document = (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
-        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
         '<w:body>'
         + "".join(body)
         + sect_pr
@@ -224,6 +300,8 @@ def build_docx(graph, meta, *, trim=(6.0, 9.0)) -> bytes:
         zf.writestr("word/document.xml", document)
         zf.writestr("word/_rels/document.xml.rels", _DOC_RELS())
         zf.writestr("word/styles.xml", _STYLES())
+        zf.writestr("word/footer1.xml", _FOOTER())
+        zf.writestr("word/settings.xml", _SETTINGS())
     return buf.getvalue()
 
 
@@ -244,7 +322,7 @@ def print_spec(graph, meta, *, trim=(6.0, 9.0), paper="white") -> Dict[str, Any]
     per_page = SPINE_IN_PER_PAGE_CREAM if paper == "cream" else SPINE_IN_PER_PAGE_WHITE
 
     words = _book_word_count(graph)
-    page_count = max(MIN_PAGE_COUNT, int(round(words / WORDS_PER_PAGE_6x9)) or MIN_PAGE_COUNT)
+    page_count = _estimate_page_count(graph)
 
     spine_width_in = round(page_count * per_page, 4)
     full_w = round(BLEED_IN * 2 + trim_w * 2 + spine_width_in, 4)

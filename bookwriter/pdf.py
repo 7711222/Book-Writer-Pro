@@ -30,7 +30,7 @@ class PdfUnavailable(RuntimeError):
 
 _INSTALL_HINT = (
     "PDF export needs the optional 'reportlab' package. Install it with: "
-    'pip install -e ".[pdf]"   (or: pip install reportlab pillow)'
+    'pip install -e ".[pdf]"   (or: pip install reportlab pillow pypdf)'
 )
 
 
@@ -304,8 +304,10 @@ def _full_pdf_single(graph, meta, *, art_bytes=None, ext="png",
     the interior so the whole book is one PDF."""
     from reportlab.lib.pagesizes import inch
     from reportlab.lib.enums import TA_CENTER
+    from reportlab.lib.colors import HexColor
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak
+    from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer,
+                                    PageBreak, KeepInFrame)
     from xml.sax.saxutils import escape as esc
 
     W, H = trim[0] * inch, trim[1] * inch
@@ -318,6 +320,14 @@ def _full_pdf_single(graph, meta, *, art_bytes=None, ext="png",
         if art_bytes:
             _draw_cover_fill(c, art_bytes, W, H)
             _scrim(c, W, H)
+        else:
+            # No art: paint the same dark ground front_cover_pdf uses so the
+            # white cover text is visible (white-on-white otherwise).
+            c.setFillColor(HexColor("#15171c"))
+            c.rect(0, 0, W, H, stroke=0, fill=1)
+            c.setStrokeColor(HexColor("#8a1c2b"))
+            c.setLineWidth(4)
+            c.rect(W * 0.05, H * 0.04, W * 0.90, H * 0.92, stroke=1, fill=0)
 
     doc = SimpleDocTemplate(buf, pagesize=(W, H), leftMargin=0.75 * inch,
                             rightMargin=0.75 * inch, topMargin=0.9 * inch,
@@ -326,12 +336,29 @@ def _full_pdf_single(graph, meta, *, art_bytes=None, ext="png",
     centered = ParagraphStyle("Cen", parent=ss["Normal"], alignment=TA_CENTER,
                               fontName="Times-Bold", fontSize=30, leading=36,
                               textColor="white")
+    cover_sub = ParagraphStyle("CovSub", parent=ss["Normal"], alignment=TA_CENTER,
+                               fontName="Times-Italic", fontSize=16, leading=22,
+                               textColor="white")
+    cover_author = ParagraphStyle("CovAuth", parent=ss["Normal"], alignment=TA_CENTER,
+                                  fontName="Times-Roman", fontSize=18, leading=24,
+                                  textColor="white")
     body = ParagraphStyle("Body", parent=ss["Normal"], fontName="Times-Roman",
                           fontSize=11.5, leading=16.5, firstLineIndent=16)
     chap = ParagraphStyle("Chap", parent=ss["Heading1"], fontName="Times-Bold",
                           fontSize=20, leading=26, alignment=TA_CENTER, spaceAfter=22)
 
-    story: List[Any] = [Spacer(1, H * 0.78), Paragraph(esc(meta.title.upper()), centered), PageBreak()]
+    cover_block: List[Any] = [Paragraph(esc(meta.title.upper()), centered)]
+    if meta.subtitle:
+        cover_block += [Spacer(1, 8), Paragraph(esc(meta.subtitle), cover_sub)]
+    cover_block += [Spacer(1, 14), Paragraph(esc(meta.author_full()), cover_author)]
+    # KeepInFrame shrinks a long title/subtitle to fit page 1 — overflowing
+    # would push white cover text onto the white second page.
+    top_space = H * 0.60
+    avail_h = max(1.0, (H - 1.8 * inch) - top_space)
+    story: List[Any] = [Spacer(1, top_space),
+                        KeepInFrame(W - 1.5 * inch, avail_h, cover_block,
+                                    mode="shrink"),
+                        PageBreak()]
     for n in sorted(graph.chapters):
         rec = graph.chapters[n]
         story.append(Paragraph(esc(rec.title), chap))

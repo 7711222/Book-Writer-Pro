@@ -8,6 +8,7 @@ import unittest
 from unittest import mock
 
 from bookwriter import images
+from bookwriter import runtime_config as rcmod
 from bookwriter.config import Settings, QUALITY_PROFILES
 from bookwriter.mock import MockLLM
 from bookwriter.pipeline import BookPipeline
@@ -18,12 +19,15 @@ class _EnvGuard(unittest.TestCase):
         "BOOKWRITER_IMAGE_PROVIDER", "PIXIO_API_KEY", "OPENAI_API_KEY",
         "BOOKWRITER_IMAGE_URL", "BOOKWRITER_PIXIO_MODEL", "PIXIO_IMAGE_MODEL",
         "BOOKWRITER_IMAGE_BODY", "BOOKWRITER_IMAGE_RESULT_PATH", "BOOKWRITER_IMAGE_AUTH",
+        "BOOKWRITER_IMAGE_ALLOW_PRIVATE",
     ]
 
     def setUp(self):
         self._saved = {k: os.environ.get(k) for k in self._VARS}
+        self._saved_overrides = {k: rcmod._overrides.get(k) for k in self._VARS}
         for k in self._VARS:
             os.environ.pop(k, None)
+            rcmod._overrides.pop(k, None)  # runtime overrides shadow os.environ
         images.PixioImageProvider._discovered_model = None
 
     def tearDown(self):
@@ -32,6 +36,11 @@ class _EnvGuard(unittest.TestCase):
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
+        for k, v in self._saved_overrides.items():
+            if v is None:
+                rcmod._overrides.pop(k, None)
+            else:
+                rcmod._overrides[k] = v
 
 
 class TestImageSelection(_EnvGuard):
@@ -140,6 +149,108 @@ class TestOpenAIAndHttpProviders(_EnvGuard):
     def test_dig_helper(self):
         self.assertEqual(images._dig({"a": [{"b": 5}]}, "a.0.b"), 5)
         self.assertIsNone(images._dig({"a": []}, "a.3.b"))
+
+
+# --------------------------------------------------------------------------- #
+# Outbound-fetch hardening: SSRF guard + response-size cap (_check_url et al.)
+# --------------------------------------------------------------------------- #
+
+class _FakeResp:
+    """Minimal stand-in for an http.client.HTTPResponse."""
+
+    def __init__(self, body=b"", content_length=None, code=200):
+        self._body = body
+        self.headers = ({} if content_length is None
+                        else {"Content-Length": str(content_length)})
+        self._code = code
+
+    def read(self, n=-1):
+        return self._body if n is None or n < 0 else self._body[:n]
+
+    def getcode(self):
+        return self._code
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class TestUrlGuards(_EnvGuard):
+    # IP-literal URLs only — getaddrinfo resolves them without touching DNS.
+
+    def test_rejects_non_http_scheme(self):
+        with self.assertRaises(RuntimeError) as ctx:
+            images._check_url("file:///etc/passwd")
+        self.assertIn("non-http", str(ctx.exception))
+
+    def test_rejects_loopback_by_default(self):
+        with self.assertRaises(RuntimeError) as ctx:
+            images._check_url("http://127.0.0.1:8188/generate")
+        self.assertIn("BOOKWRITER_IMAGE_ALLOW_PRIVATE", str(ctx.exception))
+
+    def test_rejects_cloud_metadata_address(self):
+        with self.assertRaises(RuntimeError):
+            images._check_url("http://169.254.169.254/latest/meta-data/")
+
+    def test_rejects_private_range(self):
+        with self.assertRaises(RuntimeError):
+            images._check_url("http://10.0.0.5/img.png")
+
+    def test_private_allowed_with_optin_flag(self):
+        os.environ["BOOKWRITER_IMAGE_ALLOW_PRIVATE"] = "1"
+        images._check_url("http://127.0.0.1:8188/generate")  # must not raise
+
+    def test_optin_flag_still_refuses_non_http(self):
+        os.environ["BOOKWRITER_IMAGE_ALLOW_PRIVATE"] = "1"
+        with self.assertRaises(RuntimeError):
+            images._check_url("file:///etc/passwd")
+
+    def test_public_address_allowed(self):
+        images._check_url("https://93.184.216.34/img.png")  # must not raise
+
+    def test_redirect_targets_are_rechecked(self):
+        import urllib.request
+        handler = images._SafeRedirectHandler()
+        req = urllib.request.Request("https://93.184.216.34/a")
+        with self.assertRaises(RuntimeError):
+            handler.redirect_request(req, None, 302, "Found", {},
+                                     "http://169.254.169.254/latest/meta-data/")
+
+    def test_http_provider_refuses_private_result_url(self):
+        # The endpoint answers, but points the "image" at an internal address.
+        os.environ["BOOKWRITER_IMAGE_URL"] = "https://api.example.com/img"
+        prov = images.HttpImageProvider()
+        with mock.patch.object(images, "_post_json",
+                               return_value={"url": "http://169.254.169.254/secret"}):
+            with self.assertRaises(RuntimeError) as ctx:
+                prov.generate("a castle")
+        self.assertIn("private/internal", str(ctx.exception))
+
+
+class TestResponseSizeCap(_EnvGuard):
+    def test_declared_content_length_over_cap_rejected(self):
+        with mock.patch.object(images, "MAX_FETCH_BYTES", 10):
+            with self.assertRaises(RuntimeError) as ctx:
+                images._read_capped(_FakeResp(b"x", content_length=11), "https://x/y")
+        self.assertIn("cap", str(ctx.exception))
+
+    def test_oversized_body_without_length_rejected(self):
+        with mock.patch.object(images, "MAX_FETCH_BYTES", 10):
+            with self.assertRaises(RuntimeError):
+                images._read_capped(_FakeResp(b"x" * 11), "https://x/y")
+
+    def test_body_at_cap_ok(self):
+        with mock.patch.object(images, "MAX_FETCH_BYTES", 10):
+            self.assertEqual(images._read_capped(_FakeResp(b"x" * 10), "u"), b"x" * 10)
+
+    def test_download_reads_through_capped_request(self):
+        with mock.patch.object(images, "_opener") as op:
+            op.open.return_value = _FakeResp(b"IMGBYTES")
+            body = images._download("https://93.184.216.34/x.png")
+        self.assertEqual(body, b"IMGBYTES")
+        op.open.assert_called_once()
 
 
 class TestChapterPrompt(unittest.TestCase):

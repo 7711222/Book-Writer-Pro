@@ -6,10 +6,13 @@ exposes routes through here; the API module only deals with HTTP concerns.
 
 The write job runs ``BookPipeline.write_all`` on a daemon thread; its on_event
 callback publishes structured events to the :class:`EventBroker`, which the SSE
-endpoint replays-then-tails. Exactly one job per book id (enforced by the broker).
+endpoint replays-then-tails. Exactly one job per book id: the broker enforces it
+in-process, and a cross-process file lock (``bookwriter.locks``) also excludes
+writers in other processes (e.g. the MCP server) sharing the same data dir.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -19,7 +22,7 @@ import shutil
 import threading
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from ..config import (
     Settings,
@@ -36,6 +39,7 @@ from ..kdp import (
     generate_kdp_metadata,
     generate_marketing as _generate_marketing,
 )
+from ..locks import BookLockedError, book_write_lock
 from ..print_export import build_docx, print_spec as _print_spec, build_print_cover_svg
 from ..royalties import estimate_page_count, estimate_royalties
 from ..pipeline import BookPipeline
@@ -43,6 +47,11 @@ from ..store import BookStore, _write_json
 from .broker import EventBroker
 
 logger = logging.getLogger(__name__)
+
+# How long a quick mutator (edit/revise/append) waits for the cross-process
+# write lock before returning 409. Long enough to ride out another quick op,
+# short enough that colliding with a full write job fails fast.
+_MUTATE_LOCK_TIMEOUT = 0.5
 
 
 class ServiceError(Exception):
@@ -61,6 +70,15 @@ def _now_iso() -> str:
 def _slug(text: str) -> str:
     s = re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")
     return s[:48] or "book"
+
+
+def _display_filename(text: str) -> str:
+    """Human-readable export filename stem: keeps Unicode letters (a Cyrillic
+    title stays readable), strips path separators / control chars / quotes.
+    The API layer emits it RFC 5987-encoded with an ASCII fallback."""
+    s = re.sub(r'[\\/:*?"<>|\x00-\x1f]+', " ", (text or ""))
+    s = re.sub(r"\s+", " ", s).strip()
+    return s[:120] or "book"
 
 
 # The exact shape of an id we mint: a lowercase slug + "-" + 6 hex chars. We
@@ -116,6 +134,21 @@ class BookService:
         if not self._book_exists(book_id):
             raise ServiceError(404, f"Book {book_id!r} not found.")
         return self._read_meta(book_id)
+
+    @contextlib.contextmanager
+    def _write_lock(self, book_id: str, timeout: float = _MUTATE_LOCK_TIMEOUT) -> Iterator[None]:
+        """Cross-process writer lock for one book, as a 409 on contention.
+
+        The broker's one-job-per-book guard is in-process memory only; this
+        OS-level lock also excludes the MCP server (a separate process on the
+        same data dir), so concurrent graph saves can't silently lose updates.
+        """
+        try:
+            with book_write_lock(self._book_dir(book_id), timeout=timeout):
+                yield
+        except BookLockedError:
+            raise ServiceError(
+                409, "Another write is in progress for this book; try again shortly.")
 
     def _make_id(self, title: str) -> str:
         base = _slug(title)
@@ -337,10 +370,13 @@ class BookService:
             )
         except ServiceError:
             raise
-        except Exception as e:
-            # Planning failed — clean up the half-created book dir.
+        except Exception:
+            # Planning failed — clean up the half-created book dir. Log the full
+            # detail server-side; the client gets a generic message so provider
+            # error bodies / filesystem paths never leak.
+            logger.exception("planning failed for book %s", book_id)
             shutil.rmtree(self._book_dir(book_id), ignore_errors=True)
-            raise ServiceError(500, f"Planning failed: {e}")
+            raise ServiceError(500, "Planning failed.")
 
         # A user-supplied title is authoritative; otherwise use the planned one.
         if req.title:
@@ -408,9 +444,10 @@ class BookService:
                 llm, settings, ledger, text=text, title=req.title, genre=req.genre,
                 guidance=req.guidance or "", analyze=analyze, run_extract=analyze,
             )
-        except Exception as e:  # noqa: BLE001 - surfaced to client; clean up
+        except Exception:  # noqa: BLE001 - clean up; generic message to client
+            logger.exception("import failed for book %s", book_id)
             shutil.rmtree(self._book_dir(book_id), ignore_errors=True)
-            raise ServiceError(500, f"Import failed: {e}")
+            raise ServiceError(500, "Import failed.")
 
         store = BookStore(self._book_dir(book_id))
         store.save_graph(graph)
@@ -443,110 +480,116 @@ class BookService:
         """Replace a chapter's prose (manual edit). Instant; no model needed.
         Optionally re-run continuity extraction when ``reextract`` and creds exist."""
         meta = self._require_meta(book_id)
-        store = BookStore(self._book_dir(book_id))
-        graph = store.load_graph()
-        if graph is None:
-            raise ServiceError(404, f"Book {book_id!r} has no plan.")
-        plan = graph.bible.plan(n)
-        if plan is None:
-            raise ServiceError(404, f"Chapter {n} is not in the outline.")
-        text = (req.text or "").strip()
-        if not text:
-            raise ServiceError(400, "Chapter text cannot be empty.")
+        with self._write_lock(book_id):
+            store = BookStore(self._book_dir(book_id))
+            graph = store.load_graph()
+            if graph is None:
+                raise ServiceError(404, f"Book {book_id!r} has no plan.")
+            plan = graph.bible.plan(n)
+            if plan is None:
+                raise ServiceError(404, f"Chapter {n} is not in the outline.")
+            text = (req.text or "").strip()
+            if not text:
+                raise ServiceError(400, "Chapter text cannot be empty.")
 
-        from ..models import ChapterRecord
-        rec = graph.chapters.get(n) or ChapterRecord(number=n, title=plan.title, text="")
-        rec.text = text
-        if req.title:
-            rec.title = req.title.strip()
-            plan.title = req.title.strip()
-        rec.word_count = len(text.split())
-        rec.compute_fingerprint()
-        graph.chapters[n] = rec
+            from ..models import ChapterRecord
+            rec = graph.chapters.get(n) or ChapterRecord(number=n, title=plan.title, text="")
+            rec.text = text
+            if req.title:
+                rec.title = req.title.strip()
+                plan.title = req.title.strip()
+            rec.word_count = len(text.split())
+            rec.compute_fingerprint()
+            graph.chapters[n] = rec
 
-        settings = self._make_settings(meta, book_id)
-        synopsis = rec.synopsis_line
-        if req.reextract:
-            mock = bool(req.mock) if req.mock is not None else bool(meta.get("mock", False))
-            if mock or self._live(meta.get("provider") or None):
-                try:
-                    from ..extractor import extract_delta
-                    llm = self._make_llm(mock, meta)
-                    delta = extract_delta(llm, settings, CostLedger(), graph, plan, rec)
-                    graph.apply_delta(delta)
-                    synopsis = delta.synopsis_line
-                except Exception:  # noqa: BLE001 - best-effort
-                    pass
-        graph.record_chapter(rec, synopsis, settings.synopsis_line_chars)
-        store.save_chapter(rec)
-        store.save_graph(graph)
-        store.assemble_manuscript(graph)
-        return self._chapter_payload(book_id, graph, n)
+            settings = self._make_settings(meta, book_id)
+            synopsis = rec.synopsis_line
+            if req.reextract:
+                mock = bool(req.mock) if req.mock is not None else bool(meta.get("mock", False))
+                if mock or self._live(meta.get("provider") or None):
+                    try:
+                        from ..extractor import extract_delta
+                        llm = self._make_llm(mock, meta)
+                        delta = extract_delta(llm, settings, CostLedger(), graph, plan, rec)
+                        graph.apply_delta(delta)
+                        synopsis = delta.synopsis_line
+                    except Exception:  # noqa: BLE001 - best-effort
+                        pass
+            graph.record_chapter(rec, synopsis, settings.synopsis_line_chars)
+            store.save_chapter(rec)
+            store.save_graph(graph)
+            store.assemble_manuscript(graph)
+            return self._chapter_payload(book_id, graph, n)
 
     def revise_chapter(self, book_id: str, n: int, req: "ReviseRequest") -> Dict[str, Any]:  # type: ignore[name-defined]
         """AI-revise an existing chapter per instructions (or polish if none)."""
         meta = self._require_meta(book_id)
-        store = BookStore(self._book_dir(book_id))
-        graph = store.load_graph()
-        if graph is None:
-            raise ServiceError(404, f"Book {book_id!r} has no plan.")
-        plan = graph.bible.plan(n)
-        rec = graph.chapters.get(n)
-        if plan is None or rec is None:
-            raise ServiceError(404, f"Chapter {n} hasn't been written yet.")
+        with self._write_lock(book_id):
+            store = BookStore(self._book_dir(book_id))
+            graph = store.load_graph()
+            if graph is None:
+                raise ServiceError(404, f"Book {book_id!r} has no plan.")
+            plan = graph.bible.plan(n)
+            rec = graph.chapters.get(n)
+            if plan is None or rec is None:
+                raise ServiceError(404, f"Chapter {n} hasn't been written yet.")
 
-        mock = bool(req.mock) if req.mock is not None else bool(meta.get("mock", False))
-        prov = meta.get("provider") or None
-        if not mock and not self._live(prov):
-            raise ServiceError(400, self._no_creds_msg(prov))
+            mock = bool(req.mock) if req.mock is not None else bool(meta.get("mock", False))
+            prov = meta.get("provider") or None
+            if not mock and not self._live(prov):
+                raise ServiceError(400, self._no_creds_msg(prov))
 
-        settings = self._make_settings(meta, book_id)
-        llm = self._make_llm(mock, meta)
-        ledger = CostLedger()
-        from ..writer import revise_chapter as _revise
-        try:
-            new_rec = _revise(llm, settings, ledger, graph, plan, rec.text,
-                              instructions=req.instructions or "")
-        except Exception as e:  # noqa: BLE001
-            raise ServiceError(500, f"Revision failed: {e}")
-        graph.chapters[n] = new_rec
-        graph.record_chapter(new_rec, new_rec.synopsis_line, settings.synopsis_line_chars)
-        store.save_chapter(new_rec)
-        store.save_graph(graph)
-        store.assemble_manuscript(graph)
-        return self._chapter_payload(book_id, graph, n)
+            settings = self._make_settings(meta, book_id)
+            llm = self._make_llm(mock, meta)
+            ledger = CostLedger()
+            from ..writer import revise_chapter as _revise
+            try:
+                new_rec = _revise(llm, settings, ledger, graph, plan, rec.text,
+                                  instructions=req.instructions or "")
+            except Exception:  # noqa: BLE001
+                # Full detail (provider bodies, paths) stays in the server log.
+                logger.exception("revision failed for book %s chapter %s", book_id, n)
+                raise ServiceError(500, "Revision failed.")
+            graph.chapters[n] = new_rec
+            graph.record_chapter(new_rec, new_rec.synopsis_line, settings.synopsis_line_chars)
+            store.save_chapter(new_rec)
+            store.save_graph(graph)
+            store.assemble_manuscript(graph)
+            return self._chapter_payload(book_id, graph, n)
 
     def append_chapters(self, book_id: str, req: "AppendChaptersRequest") -> Dict[str, Any]:  # type: ignore[name-defined]
         """Propose & append N new outline chapters that continue the story. They
         are left UNwritten — the caller then runs the normal write/generate flow."""
         meta = self._require_meta(book_id)
-        store = BookStore(self._book_dir(book_id))
-        graph = store.load_graph()
-        if graph is None:
-            raise ServiceError(404, f"Book {book_id!r} has no plan.")
-        mock = bool(req.mock) if req.mock is not None else bool(meta.get("mock", False))
-        prov = meta.get("provider") or None
-        if not mock and not self._live(prov):
-            raise ServiceError(400, self._no_creds_msg(prov))
+        with self._write_lock(book_id):
+            store = BookStore(self._book_dir(book_id))
+            graph = store.load_graph()
+            if graph is None:
+                raise ServiceError(404, f"Book {book_id!r} has no plan.")
+            mock = bool(req.mock) if req.mock is not None else bool(meta.get("mock", False))
+            prov = meta.get("provider") or None
+            if not mock and not self._live(prov):
+                raise ServiceError(400, self._no_creds_msg(prov))
 
-        settings = self._make_settings(meta, book_id)
-        llm = self._make_llm(mock, meta)
-        from ..planner import extend_outline
-        try:
-            new_plans = extend_outline(
-                llm, settings, CostLedger(), graph,
-                count=req.count, words_per_chapter=req.words_per_chapter,
-                guidance=req.guidance or "",
-            )
-        except Exception as e:  # noqa: BLE001
-            raise ServiceError(500, f"Could not extend the outline: {e}")
-        graph.bible.outline.extend(new_plans)
-        graph.bible.target_chapters = len(graph.bible.outline)
-        store.save_graph(graph)
-        return {
-            "added": [{"number": p.number, "title": p.title} for p in new_plans],
-            "chapters_total": len(graph.bible.outline),
-        }
+            settings = self._make_settings(meta, book_id)
+            llm = self._make_llm(mock, meta)
+            from ..planner import extend_outline
+            try:
+                new_plans = extend_outline(
+                    llm, settings, CostLedger(), graph,
+                    count=req.count, words_per_chapter=req.words_per_chapter,
+                    guidance=req.guidance or "",
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("outline extension failed for book %s", book_id)
+                raise ServiceError(500, "Could not extend the outline.")
+            graph.bible.outline.extend(new_plans)
+            graph.bible.target_chapters = len(graph.bible.outline)
+            store.save_graph(graph)
+            return {
+                "added": [{"number": p.number, "title": p.title} for p in new_plans],
+                "chapters_total": len(graph.bible.outline),
+            }
 
     # ------------------------------------------------------------------ #
     # Read
@@ -748,8 +791,9 @@ class BookService:
                 edition=req.edition or "",
                 contributors=req.contributors or [],
             )
-        except Exception as e:  # noqa: BLE001 - surfaced to client
-            raise ServiceError(500, f"KDP metadata generation failed: {e}")
+        except Exception:  # noqa: BLE001 - generic message to client
+            logger.exception("KDP metadata generation failed for book %s", book_id)
+            raise ServiceError(500, "KDP metadata generation failed.")
 
         # Apply user overrides that the generator may not honor verbatim.
         kdp_meta.language = req.language or "English"
@@ -842,16 +886,23 @@ class BookService:
                 author_first="",
                 author_last="",
             )
-        os.makedirs(out_dir, exist_ok=True)
         store = BookStore(self._book_dir(book_id))
         images = store.collect_images([p.number for p in graph.bible.outline])
+        # Embed a previously generated AI cover, like build_kdp_kit does.
+        art, art_ext = self._load_cover_art(book_id)
+        # Build the bytes BEFORE opening the file: open("wb") first would leave
+        # a 0-byte manuscript.epub behind if build_epub raised, and every later
+        # call would return that empty file as "already built".
+        data = build_epub(graph, kdp_meta, images=images,
+                          art_bytes=art, art_ext=art_ext or "png")
+        os.makedirs(out_dir, exist_ok=True)
         with open(epub, "wb") as f:
-            f.write(build_epub(graph, kdp_meta, images=images))
+            f.write(data)
         return epub
 
     def epub_filename(self, book_id: str) -> str:
         meta = self._require_meta(book_id)
-        return f"{_slug(meta.get('title') or book_id)}.epub"
+        return f"{_display_filename(meta.get('title') or book_id)}.epub"
 
     # ------------------------------------------------------------------ #
     # Print / pricing / marketing
@@ -885,7 +936,7 @@ class BookService:
 
     def docx_filename(self, book_id: str) -> str:
         meta = self._require_meta(book_id)
-        return f"{_slug(meta.get('title') or book_id)}.docx"
+        return f"{_display_filename(meta.get('title') or book_id)}.docx"
 
     def print_spec(self, book_id: str) -> Dict[str, Any]:
         meta = self._require_meta(book_id)
@@ -953,8 +1004,9 @@ class BookService:
             )
         try:
             art, ext = generate_cover_art(graph.bible)
-        except Exception as e:  # noqa: BLE001 - network/provider error -> client
-            raise ServiceError(502, f"AI cover generation failed: {e}")
+        except Exception:  # noqa: BLE001 - network/provider error, sanitized
+            logger.exception("AI cover generation failed for book %s", book_id)
+            raise ServiceError(502, "AI cover generation failed.")
 
         ext = (ext or "png").lower().lstrip(".")
         d = self._kdp_dir(book_id)
@@ -1003,18 +1055,25 @@ class BookService:
             data = _pdf.build_pdf(part, graph, km, art_bytes=art, ext=ext or "png")
         except _pdf.PdfUnavailable as e:
             raise ServiceError(501, str(e))
-        fname = f"{_slug(meta.get('title') or book_id)}-{part}.pdf"
+        fname = f"{_display_filename(meta.get('title') or book_id)}-{part}.pdf"
         return data, fname
 
     def estimate_pricing(self, book_id: str, req: "PricingRequest") -> Dict[str, Any]:  # type: ignore[name-defined]
         self._require_meta(book_id)
         graph = self._load_graph_or_404(book_id)
         pages = estimate_page_count(graph)
+        # Use the real built EPUB's size for the delivery-fee math when one
+        # exists; else keep the 1.0 MB default assumption.
+        ebook_file_mb = 1.0
+        epub = os.path.join(self._kdp_dir(book_id), "manuscript.epub")
+        if os.path.isfile(epub):
+            ebook_file_mb = os.path.getsize(epub) / 1e6
         return estimate_royalties(
             list_price=req.list_price,
             marketplace=req.marketplace or "US",
             page_count=pages,
             paper=req.paper or "white",
+            ebook_file_mb=ebook_file_mb,
         )
 
     def generate_marketing(self, book_id: str, req: "MarketingRequest") -> Dict[str, Any]:  # type: ignore[name-defined]
@@ -1042,11 +1101,14 @@ class BookService:
 
         try:
             marketing = _generate_marketing(llm, settings, ledger, graph, kdp_meta)
-        except Exception as e:  # noqa: BLE001 - surfaced to client
-            raise ServiceError(500, f"Marketing generation failed: {e}")
+        except Exception:  # noqa: BLE001 - generic message to client
+            logger.exception("marketing generation failed for book %s", book_id)
+            raise ServiceError(500, "Marketing generation failed.")
 
-        # Persist a marketing.json snapshot in the book dir.
-        _write_json(os.path.join(self._book_dir(book_id), "marketing.json"), marketing)
+        # Persist a marketing.json snapshot in the kit dir — the same
+        # kdp/marketing.json the MCP server reads/writes, so either surface's
+        # copy gets reused by a later prepare.
+        _write_json(os.path.join(self._kdp_dir(book_id), "marketing.json"), marketing)
 
         return marketing
 
@@ -1056,6 +1118,14 @@ class BookService:
     def delete_book(self, book_id: str) -> Dict[str, Any]:
         self._require_meta(book_id)
         if self.broker.is_running(book_id):
+            raise ServiceError(409, "A write job is running for this book; cannot delete.")
+        # Also refuse while ANOTHER process (e.g. the MCP server) is writing:
+        # probe the cross-process lock, then release it before the rmtree (an
+        # open handle would block deleting the lock file on Windows).
+        try:
+            with book_write_lock(self._book_dir(book_id), timeout=0):
+                pass
+        except BookLockedError:
             raise ServiceError(409, "A write job is running for this book; cannot delete.")
         shutil.rmtree(self._book_dir(book_id), ignore_errors=True)
         # Release the in-memory event ring so deleted books don't leak their
@@ -1077,8 +1147,17 @@ class BookService:
                 self._no_creds_msg(meta.get("provider") or None),
             )
 
+        # Cross-process guard first: the file lock also excludes an MCP-process
+        # write on the same book dir, which the in-memory broker cannot see.
+        write_lock = book_write_lock(self._book_dir(book_id), timeout=0)
+        try:
+            write_lock.__enter__()
+        except BookLockedError:
+            raise ServiceError(409, "A write job is already running for this book.")
+
         # Reserve the running slot atomically; broker enforces one-job-per-book.
         if not self.broker.start_job(book_id):
+            write_lock.__exit__(None, None, None)
             raise ServiceError(409, "A write job is already running for this book.")
 
         only = req.only or None
@@ -1100,12 +1179,19 @@ class BookService:
                 if not pipe.load():
                     raise RuntimeError("No plan found for this book.")
                 pipe.write_all(resume=not restart, only=only)
-                self.broker.publish(book_id, {"type": "done"})
-            except Exception as e:  # noqa: BLE001 - surfaced to the client via SSE
+                terminal = {"type": "done"}
+            except Exception:  # noqa: BLE001 - surfaced to the client via SSE
                 # Always record the full traceback server-side — the SSE client may
-                # have disconnected, and we must not lose the failure.
+                # have disconnected, and we must not lose the failure. The client
+                # gets a generic message: exception text can carry provider
+                # response bodies and filesystem paths.
                 logger.exception("write job failed for book %s", book_id)
-                self.broker.publish(book_id, {"type": "error", "message": str(e)})
+                terminal = {"type": "error", "message": "Generation failed."}
+            finally:
+                # Release the cross-process lock BEFORE publishing the terminal
+                # event, so a client reacting to it can start a new job at once.
+                write_lock.__exit__(None, None, None)
+            self.broker.publish(book_id, terminal)
 
         t = threading.Thread(target=_run, name=f"write-{book_id}", daemon=True)
         with self._lock:

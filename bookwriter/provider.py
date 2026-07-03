@@ -141,7 +141,10 @@ _PROVIDER_DEFAULTS = {
 #             prompt from stdin (the hang-proof, documented non-interactive form).
 #   grok-cli: `grok --prompt <text>` — bare `grok` opens an interactive TUI and
 #             ignores stdin, so the prompt must be passed as an ARGUMENT after
-#             --prompt (see STDIN_FALSE_PROVIDERS / make_llm).
+#             --prompt (see STDIN_FALSE_PROVIDERS / make_llm). Argv prompts are
+#             capped by the OS command line (~32 KB on Windows); a {promptfile}
+#             placeholder in the command feeds the prompt via a temp file
+#             instead (see llm_cli.PROMPT_FILE_TOKEN).
 #   cli:      no default — must be supplied via BOOKWRITER_CLI_CMD.
 _CLI_DEFAULTS = {
     "codex": ["codex", "exec", "-"],
@@ -160,11 +163,32 @@ _CLI_CMD_ENV = {
 }
 
 
+def cli_cmd_env(provider: str) -> str:
+    """The env var that configures *provider*'s CLI command."""
+    return _CLI_CMD_ENV.get(provider, "BOOKWRITER_CLI_CMD")
+
+
+def _strip_outer_quotes(token: str) -> str:
+    """Drop one matched pair of surrounding quotes from a token.
+
+    Non-POSIX shlex keeps quote characters inside tokens, so on Windows
+    ``"C:\\Program Files\\Grok\\grok.exe" --prompt`` would otherwise yield an
+    argv[0] with literal quotes — which shutil.which() and CreateProcess both
+    reject. Quoted paths are the normal way to write space-containing paths.
+    """
+    if len(token) >= 2 and token[0] == token[-1] and token[0] in "'\"":
+        return token[1:-1]
+    return token
+
+
 def cli_command(provider: str) -> List[str]:
     """Resolve the argv for a CLI-backed provider (env override wins)."""
     override = rc.getenv(_CLI_CMD_ENV.get(provider, ""))
     if override:
-        return shlex.split(override, posix=(os.name != "nt"))
+        if os.name == "nt":
+            # posix=False keeps backslash paths intact but retains the quotes.
+            return [_strip_outer_quotes(t) for t in shlex.split(override, posix=False)]
+        return shlex.split(override)
     return list(_CLI_DEFAULTS.get(provider, []))
 
 _ENV_BY_TIER = {
@@ -204,6 +228,11 @@ _EXTRA_PRICES = {
     "grok-4": ModelPrice.from_base(3.0, 15.0),
     "grok-3": ModelPrice.from_base(3.0, 15.0),
     "grok-3-mini": ModelPrice.from_base(0.3, 0.5),
+    # The rest of the OpenRouter catalog — every model the UI offers must be
+    # priced, or the cost meter silently reports $0 for real per-token spend.
+    "anthropic/claude-sonnet-4.6": ModelPrice.from_base(3.0, 15.0),
+    "x-ai/grok-4": ModelPrice.from_base(3.0, 15.0),
+    "meta-llama/llama-3.3-70b-instruct": ModelPrice.from_base(0.12, 0.3),
 }
 for _mid, _price in _EXTRA_PRICES.items():
     MODEL_PRICES.setdefault(_mid, _price)
@@ -415,7 +444,8 @@ MODEL_CATALOG = {
     "openrouter": [
         ("openai/gpt-4.1", "GPT-4.1"),
         ("openai/gpt-4.1-mini", "GPT-4.1 mini"),
-        ("anthropic/claude-3.7-sonnet", "Claude 3.7 Sonnet"),
+        # claude-3.7-sonnet was retired by Anthropic (2026-02) — offer a live model.
+        ("anthropic/claude-sonnet-4.6", "Claude Sonnet 4.6"),
         ("x-ai/grok-4", "Grok 4 (xAI)"),
         ("meta-llama/llama-3.3-70b-instruct", "Llama 3.3 70B"),
     ],

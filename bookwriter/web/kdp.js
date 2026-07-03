@@ -753,7 +753,9 @@
     }).catch(() => { /* leave buttons enabled; click will surface any error */ });
 
     // ------------------------------------------------- Download cover (PNG)
-    $("#kdp-cover-dl", view).addEventListener("click", () => downloadCoverPng(meta, view));
+    // Getter (not the value) so a cover generated AFTER this wiring is used:
+    // the preview and the downloaded PNG must always match.
+    $("#kdp-cover-dl", view).addEventListener("click", () => downloadCoverPng(meta, view, () => aiCoverSvg));
 
     // ------------------------------------------------------- Copy listing
     $("#kdp-copy", view).addEventListener("click", () => copyListing(id));
@@ -1061,11 +1063,13 @@
   };
 
   // --------------------------------------------------- client-side cover PNG
-  // Render the procedural cover SVG into an <img>, draw it onto a 1600×2560
-  // canvas, and export a PNG via toBlob — entirely client-side. KDP wants a
-  // raster ebook cover ~1.6:1 with the longest side at 2560px.
-  function downloadCoverPng(meta, view) {
-    const svg = coverSvgFor(meta);
+  // Render the cover SVG into an <img>, draw it onto a 1600×2560 canvas, and
+  // export a PNG via toBlob — entirely client-side. KDP wants a raster ebook
+  // cover ~1.6:1 with the longest side at 2560px. `getAi` returns the latest
+  // AI-generated cover SVG (if any), which — like the on-screen preview —
+  // takes precedence over the procedural cover.
+  function downloadCoverPng(meta, view, getAi) {
+    const svg = (getAi && getAi()) || coverSvgFor(meta);
     if (!svg) { toast("Cover unavailable.", { type: "error" }); return; }
     const btn = $("#kdp-cover-dl", view);
     btn.classList.add("is-busy"); btn.disabled = true;

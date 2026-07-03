@@ -30,6 +30,10 @@ def _ordinal(n: int) -> str:
 class MockLLM:
     def __init__(self) -> None:
         self._seen_prefixes: Set[int] = set()  # simulate cross-call prompt cache
+        # Mirrors the API backends' truncation telemetry: "end_turn" after every
+        # call (mock output is never truncated). Tests override it to simulate
+        # a max_tokens cut-off.
+        self.last_stop_reason: Optional[str] = None
 
     # ------------------------------------------------------------------
     def complete_json(self, *, stage, model, system, user, schema, max_tokens,
@@ -47,6 +51,7 @@ class MockLLM:
             data = self._delta(user)
         self._record(ledger, stage, model, system, user, cached, use_cache, cache_ttl,
                      out_tokens=len(str(data)) // 4 + 20)
+        self.last_stop_reason = "end_turn"
         return data
 
     # ------------------------------------------------------------------
@@ -73,6 +78,7 @@ class MockLLM:
                     time.sleep(delay)
         self._record(ledger, stage, model, system, user, cached, use_cache, cache_ttl,
                      out_tokens=target * 4 // 3)
+        self.last_stop_reason = "end_turn"
         return prose
 
     @staticmethod

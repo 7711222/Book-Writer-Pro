@@ -19,7 +19,12 @@ from bookwriter.print_export import (
     build_docx, print_spec, build_print_cover_svg,
     BLEED_IN, MIN_PAGE_COUNT, TWIPS_PER_INCH,
 )
-from bookwriter.royalties import estimate_royalties, estimate_page_count
+from bookwriter.royalties import (
+    estimate_royalties, estimate_page_count,
+    DELIVERY_FEE_PER_MB_US, MIN_DELIVERY_FEE,
+    PB_SMALL_FLAT_COST_US, PB_LARGE_FIXED_COST_US, PB_LARGE_PER_PAGE_US,
+    PAPERBACK_ROYALTY_RATE_LOW, PAPERBACK_ROYALTY_RATE_HIGH,
+)
 
 
 def _build_book(tmp, *, premise="a detective hunts a small town killer",
@@ -97,6 +102,67 @@ class TestDocx(unittest.TestCase):
             self.assertIn("Copyright", doc)
             # a page break before each chapter
             self.assertIn("pageBreakBefore", doc)
+
+    def test_control_chars_do_not_corrupt_docx(self):
+        # \x0b (Word soft line break) and other C0 controls routinely survive a
+        # copy-paste import; they are XML-1.0-illegal and must be stripped.
+        with tempfile.TemporaryDirectory() as tmp:
+            graph, _ = _build_book(tmp)
+            first = sorted(graph.chapters)[0]
+            graph.chapters[first].text = (
+                "Alpha\x0bbeta continues the line.\x0c\x01\x1f"
+                + chr(0xFFFE) + " Clean tail."   # U+FFFE noncharacter
+            )
+            data = build_docx(graph, _meta(graph))
+            zf = zipfile.ZipFile(io.BytesIO(data))
+            for name in zf.namelist():
+                raw = zf.read(name)
+                minidom.parseString(raw)  # raises on malformed XML
+                self.assertNotIn(b"\x0b", raw, name)
+            doc = zf.read("word/document.xml").decode("utf-8")
+            # \x0b became a space: both halves survive, unglued
+            self.assertIn("Alpha beta", doc)
+            self.assertIn("Clean tail.", doc)
+
+    def test_footer_page_number_field(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            graph, _ = _build_book(tmp)
+            zf = zipfile.ZipFile(io.BytesIO(build_docx(graph, _meta(graph))))
+            names = zf.namelist()
+            self.assertIn("word/footer1.xml", names)
+            self.assertIn("word/settings.xml", names)
+            footer = zf.read("word/footer1.xml").decode("utf-8")
+            minidom.parseString(footer)
+            self.assertIn("PAGE", footer)          # the page-number field
+            self.assertIn("fldChar", footer)
+            # the section references the footer and the parts are registered
+            doc = zf.read("word/document.xml").decode("utf-8")
+            self.assertIn('<w:footerReference w:type="default" r:id="rId2"/>', doc)
+            rels = zf.read("word/_rels/document.xml.rels").decode("utf-8")
+            self.assertIn('Target="footer1.xml"', rels)
+            self.assertIn('Target="settings.xml"', rels)
+            ctypes = zf.read("[Content_Types].xml").decode("utf-8")
+            self.assertIn("/word/footer1.xml", ctypes)
+            self.assertIn("/word/settings.xml", ctypes)
+
+    def test_gutter_and_mirror_margins(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            graph, _ = _build_book(tmp)
+        # small book (24-page floor) -> KDP's 0.375in minimum gutter
+        zf = zipfile.ZipFile(io.BytesIO(build_docx(graph, _meta(graph))))
+        doc = zf.read("word/document.xml").decode("utf-8")
+        small_gutter = int(round(0.375 * TWIPS_PER_INCH))
+        self.assertIn(f'w:gutter="{small_gutter}"', doc)
+        settings = zf.read("word/settings.xml").decode("utf-8")
+        minidom.parseString(settings)
+        self.assertIn("mirrorMargins", settings)
+        # very long book -> gutter grows (0.875in for 700+ pages)
+        for rec in graph.chapters.values():
+            rec.word_count = 100000
+        zf2 = zipfile.ZipFile(io.BytesIO(build_docx(graph, _meta(graph))))
+        doc2 = zf2.read("word/document.xml").decode("utf-8")
+        big_gutter = int(round(0.875 * TWIPS_PER_INCH))
+        self.assertIn(f'w:gutter="{big_gutter}"', doc2)
 
 
 class TestPrintSpec(unittest.TestCase):
@@ -177,8 +243,25 @@ class TestRoyalties(unittest.TestCase):
         r = estimate_royalties(list_price=4.99, page_count=200, ebook_file_mb=1.0)
         self.assertEqual(r["ebook"]["plan"], "70%")
         self.assertTrue(r["ebook"]["eligible_for_70"])
-        # 0.70 * (4.99 - 0.06) = 3.451 -> 3.45
-        self.assertAlmostEqual(r["ebook"]["royalty_per_sale"], 3.45, places=2)
+        # KDP Amazon.com fee is $0.15/MB: 0.70 * (4.99 - 0.15) = 3.388 -> 3.39
+        self.assertAlmostEqual(r["ebook"]["delivery_fee"], 0.15, places=2)
+        self.assertAlmostEqual(r["ebook"]["royalty_per_sale"], 3.39, places=2)
+
+    def test_delivery_fee_has_one_cent_minimum(self):
+        # a tiny file still pays KDP's $0.01 minimum on the 70% plan
+        r = estimate_royalties(list_price=4.99, page_count=200,
+                               ebook_file_mb=0.01)
+        self.assertAlmostEqual(r["ebook"]["delivery_fee"], MIN_DELIVERY_FEE,
+                               places=2)
+        self.assertAlmostEqual(r["ebook"]["royalty_per_sale"],
+                               round(0.70 * (4.99 - MIN_DELIVERY_FEE), 2),
+                               places=2)
+
+    def test_delivery_fee_scales_with_size(self):
+        # a 5 MB illustrated EPUB pays 5 x $0.15 = $0.75
+        r = estimate_royalties(list_price=4.99, page_count=200, ebook_file_mb=5.0)
+        self.assertAlmostEqual(r["ebook"]["delivery_fee"],
+                               round(5.0 * DELIVERY_FEE_PER_MB_US, 2), places=2)
 
     def test_below_band_is_35(self):
         r = estimate_royalties(list_price=0.99, page_count=200)
@@ -196,12 +279,42 @@ class TestRoyalties(unittest.TestCase):
         r = estimate_royalties(list_price=12.99, page_count=300, paper="white")
         pb = r["paperback"]
         printing = pb["printing_cost"]
+        # KDP's published 110+ page formula: $1.00 + 300 x $0.012 = $4.60
+        self.assertAlmostEqual(
+            printing,
+            round(PB_LARGE_FIXED_COST_US + 300 * PB_LARGE_PER_PAGE_US, 2),
+            places=2)
+        self.assertAlmostEqual(printing, 4.60, places=2)
+        # $12.99 is above the $9.99 threshold -> 60% rate
+        self.assertEqual(pb["royalty_rate"], PAPERBACK_ROYALTY_RATE_HIGH)
         expected = round(0.60 * 12.99 - printing, 2)
         self.assertAlmostEqual(pb["royalty_per_sale"], expected, places=2)
         self.assertGreater(printing, 0)
 
+    def test_paperback_small_book_flat_printing_cost(self):
+        # 24-108 pages: flat $2.30, no per-page charge
+        for pages in (24, 100, 108):
+            r = estimate_royalties(list_price=9.99, page_count=pages)
+            self.assertAlmostEqual(r["paperback"]["printing_cost"],
+                                   PB_SMALL_FLAT_COST_US, places=2,
+                                   msg=f"pages={pages}")
+        # 110 pages: $1.00 + 110 x $0.012 = $2.32
+        r = estimate_royalties(list_price=9.99, page_count=110)
+        self.assertAlmostEqual(r["paperback"]["printing_cost"], 2.32, places=2)
+
+    def test_paperback_rate_tiered_by_price(self):
+        # Since KDP's June 2025 update: below $9.99 pays 50%, at/above pays 60%.
+        low = estimate_royalties(list_price=8.99, page_count=200)["paperback"]
+        self.assertEqual(low["royalty_rate"], PAPERBACK_ROYALTY_RATE_LOW)
+        self.assertAlmostEqual(
+            low["royalty_per_sale"],
+            round(0.50 * 8.99 - low["printing_cost"], 2), places=2)
+        # $9.99 exactly earns 60% (the boundary is inclusive)
+        edge = estimate_royalties(list_price=9.99, page_count=200)["paperback"]
+        self.assertEqual(edge["royalty_rate"], PAPERBACK_ROYALTY_RATE_HIGH)
+
     def test_paperback_royalty_floored_at_zero(self):
-        # cheap price, huge page count -> printing exceeds 60% of price
+        # cheap price, huge page count -> printing exceeds the rate x price
         r = estimate_royalties(list_price=1.00, page_count=800)
         self.assertEqual(r["paperback"]["royalty_per_sale"], 0.0)
         self.assertTrue(r["paperback"]["below_cost"])

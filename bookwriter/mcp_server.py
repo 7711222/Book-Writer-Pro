@@ -25,6 +25,7 @@ Design notes for the agent reading these docstrings:
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -228,6 +229,9 @@ class _ServiceAdapter:
                     mock=bool(kw.get("mock", False)),
                     use_cache=bool(kw.get("use_cache", True)),
                     run_continuity_check=bool(kw.get("run_continuity_check", True)),
+                    provider=kw.get("provider") or None,
+                    model=kw.get("model") or None,
+                    chapter_images=bool(kw.get("chapter_images", False)),
                 )
                 res = fn(req)
                 return _flatten_create(res)
@@ -300,9 +304,13 @@ class _ServiceAdapter:
             )
             publish({"type": "done"})
             return result
-        except Exception as e:
+        except Exception:
+            # Same generic terminal the HTTP write job publishes — exception
+            # text can carry provider response bodies and filesystem paths,
+            # and web SSE viewers must not see it. The MCP tool caller still
+            # gets the real exception via the raise.
             try:
-                broker.publish(book_id, {"type": "error", "message": str(e)})
+                broker.publish(book_id, {"type": "error", "message": "Generation failed."})
             except Exception:
                 pass
             raise
@@ -328,6 +336,12 @@ class _ServiceAdapter:
         return self._local.get_kdp(book_id)
 
     def epub_path(self, book_id: str) -> str:
+        # The HTTP service builds the EPUB on demand (reusing prepare_kdp's
+        # metadata when present, else synthesizing a minimal one), so delegate
+        # to it — export_epub then matches GET /api/books/{id}/export/epub.
+        fn = getattr(self._svc, "epub_path", None)
+        if callable(fn):
+            return _map_service_errors(lambda: fn(book_id))
         return self._local.epub_path(book_id)
 
     # ---- print / royalties / marketing (local, shared dir) ------------
@@ -398,6 +412,13 @@ class BookNotFound(Exception):
     pass
 
 
+# How long a mutation waits for the cross-process book write lock before
+# failing (matches the HTTP service's _MUTATE_LOCK_TIMEOUT): long enough to
+# ride out another quick op, short enough that colliding with a full write
+# job fails fast.
+_MUTATE_LOCK_TIMEOUT = 0.5
+
+
 class _LocalBookService:
     def __init__(self, root: str):
         self.root = root
@@ -422,6 +443,26 @@ class _LocalBookService:
         from bookwriter.store import _write_json
         os.makedirs(self._book_dir(meta["id"]), exist_ok=True)
         _write_json(self._meta_path(meta["id"]), meta)  # atomic, matches HTTP service
+
+    @contextlib.contextmanager
+    def _write_lock(self, book_id: str):
+        """Cross-process writer lock for one book directory.
+
+        The HTTP server may be running against the same data dir in another
+        process; its in-memory broker guard can't see our writes (nor ours
+        its), so every on-disk mutation coordinates through the OS-level lock
+        in ``bookwriter.locks`` — the same lock BookService holds for the
+        duration of an HTTP write job. Contention maps to the busy-book
+        RuntimeError shape the MCP error contract already uses.
+        """
+        from bookwriter.locks import BookLockedError, book_write_lock
+        try:
+            with book_write_lock(self._book_dir(book_id), timeout=_MUTATE_LOCK_TIMEOUT):
+                yield
+        except BookLockedError:
+            raise RuntimeError(
+                f"A write job is already running for {book_id!r}."
+            )
 
     # ---- core wiring --------------------------------------------------
     def _settings(self, book_id: str, meta: Dict[str, Any]) -> Any:
@@ -528,7 +569,8 @@ class _LocalBookService:
                     words_per_chapter: int = 2000, title: str = "",
                     genre: str = "", guidance: str = "", profile: str = "balanced",
                     mock: bool = False, use_cache: bool = True,
-                    run_continuity_check: bool = True) -> Dict[str, Any]:
+                    run_continuity_check: bool = True, provider: str = "",
+                    model: str = "", chapter_images: bool = False) -> Dict[str, Any]:
         if not premise or not premise.strip():
             raise ValueError("premise is required")
         from bookwriter.config import QUALITY_PROFILES
@@ -536,8 +578,8 @@ class _LocalBookService:
             raise ValueError(f"unknown profile {profile!r}; choose from {sorted(QUALITY_PROFILES)}")
         if not mock:
             from bookwriter.provider import live_available, missing_credentials_message
-            if not live_available():
-                raise PermissionError(missing_credentials_message())
+            if not live_available(provider or None):
+                raise PermissionError(missing_credentials_message(provider or None))
         # id from the provided title, or a slug of the premise as a fallback.
         seed_title = title.strip() or premise.strip()[:48]
         book_id = make_book_id(
@@ -552,9 +594,9 @@ class _LocalBookService:
             "mock": bool(mock),
             "genre": genre,
             "logline": "",
-            "provider": "",   # parity with the HTTP service meta shape
-            "model": "",
-            "chapter_images": False,
+            "provider": provider or "",   # parity with the HTTP service meta shape
+            "model": model or "",
+            "chapter_images": bool(chapter_images),
             "use_cache": bool(use_cache),
             "run_continuity_check": bool(run_continuity_check),
         }
@@ -595,9 +637,6 @@ class _LocalBookService:
         self._require_creds(meta)  # clean error (not a deep SDK auth crash) if no creds
         from bookwriter.pipeline import BookPipeline
 
-        settings = self._settings(book_id, meta)
-        llm = self._make_llm(bool(meta.get("mock", False)), meta)
-
         flags: List[str] = []
 
         def _on_event(ev: Dict[str, Any]) -> None:
@@ -606,19 +645,26 @@ class _LocalBookService:
             if on_event is not None:
                 on_event(ev)
 
-        # stream_prose only when someone is listening (broker viewers); the
-        # extra delta events are wasted work for a pure local call.
-        pipe = BookPipeline(
-            llm, settings, on_event=_on_event, stream_prose=on_event is not None,
-            image_provider=self._make_image_provider(meta),
-        )
-        if not pipe.load():
-            raise BookNotFound(f"{book_id} has no plan; create_book first")
+        # Hold the cross-process lock for the whole pipeline run, exactly like
+        # the HTTP write job — an HTTP POST /write in another process 409s
+        # instead of interleaving chapter/graph saves with ours.
+        with self._write_lock(book_id):
+            settings = self._settings(book_id, meta)
+            llm = self._make_llm(bool(meta.get("mock", False)), meta)
 
-        resume = not restart
-        ledger = pipe.write_all(resume=resume, only=only)
+            # stream_prose only when someone is listening (broker viewers); the
+            # extra delta events are wasted work for a pure local call.
+            pipe = BookPipeline(
+                llm, settings, on_event=_on_event, stream_prose=on_event is not None,
+                image_provider=self._make_image_provider(meta),
+            )
+            if not pipe.load():
+                raise BookNotFound(f"{book_id} has no plan; create_book first")
 
-        snap = pipe._cost_snapshot()
+            resume = not restart
+            ledger = pipe.write_all(resume=resume, only=only)
+
+            snap = pipe._cost_snapshot()
         status = self.get_status(book_id)
         return {
             "book_id": book_id,
@@ -745,6 +791,9 @@ class _LocalBookService:
         from bookwriter.costs import CostLedger
         if not (text or "").strip():
             raise ValueError("text is required")
+        from bookwriter.config import QUALITY_PROFILES
+        if profile not in QUALITY_PROFILES:
+            raise ValueError(f"unknown profile {profile!r}; choose from {sorted(QUALITY_PROFILES)}")
         book_id = make_book_id(title.strip() or "Imported manuscript",
                               exists=lambda bid: os.path.exists(self._meta_path(bid)))
         meta = {
@@ -757,9 +806,16 @@ class _LocalBookService:
         self._write_meta(meta)
         try:
             settings = self._settings(book_id, meta)
-            llm = self._make_llm(bool(mock), meta) if (mock or analyze) else None
-            if llm is None:
-                analyze = False
+            # Mirror the HTTP service: with no creds (and not mock) fall back to
+            # a structure-only import instead of failing mid-import on a raw SDK
+            # auth error — the chapters are still imported and fully editable.
+            from bookwriter.provider import live_available
+            if mock:
+                llm = self._make_llm(True, meta)
+            elif analyze and live_available():
+                llm = self._make_llm(False, meta)
+            else:
+                llm, analyze = None, False
             graph = build_graph_from_text(
                 llm, settings, CostLedger(), text=text, title=title or None,
                 genre=genre or None, guidance=guidance, analyze=analyze, run_extract=analyze)
@@ -767,15 +823,20 @@ class _LocalBookService:
             import shutil
             shutil.rmtree(self._book_dir(book_id), ignore_errors=True)
             raise
-        store = self._store(book_id)
-        store.save_graph(graph)
-        for rec in graph.chapters.values():
-            store.save_chapter(rec)
-        store.assemble_manuscript(graph)
-        meta["title"] = (title or graph.bible.title) or meta["title"]
-        meta["genre"] = genre or graph.bible.genre or meta["genre"]
-        meta["logline"] = graph.bible.logline or ""
-        self._write_meta(meta)
+        # The id minter is deterministic (slug + title hash), so two concurrent
+        # imports of the same title target the same dir — serialize the saves.
+        # Acquired only after the analyze step so the failure-path rmtree above
+        # never runs with an open lock handle inside the dir (Windows).
+        with self._write_lock(book_id):
+            store = self._store(book_id)
+            store.save_graph(graph)
+            for rec in graph.chapters.values():
+                store.save_chapter(rec)
+            store.assemble_manuscript(graph)
+            meta["title"] = (title or graph.bible.title) or meta["title"]
+            meta["genre"] = genre or graph.bible.genre or meta["genre"]
+            meta["logline"] = graph.bible.logline or ""
+            self._write_meta(meta)
         out = self._summary(meta)
         out["chapters"] = out["chapters_total"]
         out["bible"] = graph.bible.to_dict()
@@ -785,38 +846,39 @@ class _LocalBookService:
                      title: str = "", reextract: bool = False) -> Dict[str, Any]:
         from bookwriter.models import ChapterRecord
         meta = self._read_meta(book_id)
-        store = self._store(book_id)
-        graph = self._load_graph_or_404(book_id)
-        plan = graph.bible.plan(number)
-        if plan is None:
-            raise BookNotFound(f"{book_id} chapter {number} not in outline")
-        if not (text or "").strip():
-            raise ValueError("text is required")
-        rec = graph.chapters.get(number) or ChapterRecord(number=number, title=plan.title, text="")
-        rec.text = text.strip()
-        if title:
-            rec.title = title.strip()
-            plan.title = title.strip()
-        rec.word_count = len(rec.text.split())
-        rec.compute_fingerprint()
-        graph.chapters[number] = rec
-        settings = self._settings(book_id, meta)
-        synopsis = rec.synopsis_line
-        if reextract:
-            try:
-                from bookwriter.extractor import extract_delta
-                from bookwriter.costs import CostLedger
-                delta = extract_delta(self._make_llm(bool(meta.get("mock", False)), meta),
-                                      settings, CostLedger(), graph, plan, rec)
-                graph.apply_delta(delta)
-                synopsis = delta.synopsis_line
-            except Exception:
-                pass
-        graph.record_chapter(rec, synopsis, settings.synopsis_line_chars)
-        store.save_chapter(rec)
-        store.save_graph(graph)
-        store.assemble_manuscript(graph)
-        return {"number": number, "title": rec.title, "word_count": rec.word_count}
+        with self._write_lock(book_id):
+            store = self._store(book_id)
+            graph = self._load_graph_or_404(book_id)
+            plan = graph.bible.plan(number)
+            if plan is None:
+                raise BookNotFound(f"{book_id} chapter {number} not in outline")
+            if not (text or "").strip():
+                raise ValueError("text is required")
+            rec = graph.chapters.get(number) or ChapterRecord(number=number, title=plan.title, text="")
+            rec.text = text.strip()
+            if title:
+                rec.title = title.strip()
+                plan.title = title.strip()
+            rec.word_count = len(rec.text.split())
+            rec.compute_fingerprint()
+            graph.chapters[number] = rec
+            settings = self._settings(book_id, meta)
+            synopsis = rec.synopsis_line
+            if reextract:
+                try:
+                    from bookwriter.extractor import extract_delta
+                    from bookwriter.costs import CostLedger
+                    delta = extract_delta(self._make_llm(bool(meta.get("mock", False)), meta),
+                                          settings, CostLedger(), graph, plan, rec)
+                    graph.apply_delta(delta)
+                    synopsis = delta.synopsis_line
+                except Exception:
+                    pass
+            graph.record_chapter(rec, synopsis, settings.synopsis_line_chars)
+            store.save_chapter(rec)
+            store.save_graph(graph)
+            store.assemble_manuscript(graph)
+            return {"number": number, "title": rec.title, "word_count": rec.word_count}
 
     def _require_creds(self, meta: Dict[str, Any]) -> None:
         """Raise PermissionError when a live (non-mock) op has no provider creds —
@@ -834,21 +896,22 @@ class _LocalBookService:
         from bookwriter.costs import CostLedger
         meta = self._read_meta(book_id)
         self._require_creds(meta)
-        store = self._store(book_id)
-        graph = self._load_graph_or_404(book_id)
-        plan = graph.bible.plan(number)
-        rec = graph.chapters.get(number)
-        if plan is None or rec is None:
-            raise BookNotFound(f"{book_id} chapter {number} not written yet")
-        settings = self._settings(book_id, meta)
-        new_rec = _revise(self._make_llm(bool(meta.get("mock", False)), meta),
-                          settings, CostLedger(), graph, plan, rec.text, instructions or "")
-        graph.chapters[number] = new_rec
-        graph.record_chapter(new_rec, new_rec.synopsis_line, settings.synopsis_line_chars)
-        store.save_chapter(new_rec)
-        store.save_graph(graph)
-        store.assemble_manuscript(graph)
-        return {"number": number, "title": new_rec.title, "word_count": new_rec.word_count}
+        with self._write_lock(book_id):
+            store = self._store(book_id)
+            graph = self._load_graph_or_404(book_id)
+            plan = graph.bible.plan(number)
+            rec = graph.chapters.get(number)
+            if plan is None or rec is None:
+                raise BookNotFound(f"{book_id} chapter {number} not written yet")
+            settings = self._settings(book_id, meta)
+            new_rec = _revise(self._make_llm(bool(meta.get("mock", False)), meta),
+                              settings, CostLedger(), graph, plan, rec.text, instructions or "")
+            graph.chapters[number] = new_rec
+            graph.record_chapter(new_rec, new_rec.synopsis_line, settings.synopsis_line_chars)
+            store.save_chapter(new_rec)
+            store.save_graph(graph)
+            store.assemble_manuscript(graph)
+            return {"number": number, "title": new_rec.title, "word_count": new_rec.word_count}
 
     def append_chapters(self, book_id: str, *, count: int = 3,
                         words_per_chapter: int = 2000, guidance: str = "") -> Dict[str, Any]:
@@ -856,17 +919,18 @@ class _LocalBookService:
         from bookwriter.costs import CostLedger
         meta = self._read_meta(book_id)
         self._require_creds(meta)
-        store = self._store(book_id)
-        graph = self._load_graph_or_404(book_id)
-        new_plans = extend_outline(self._make_llm(bool(meta.get("mock", False)), meta),
-                                   self._settings(book_id, meta), CostLedger(), graph,
-                                   count=count, words_per_chapter=words_per_chapter,
-                                   guidance=guidance)
-        graph.bible.outline.extend(new_plans)
-        graph.bible.target_chapters = len(graph.bible.outline)
-        store.save_graph(graph)
-        return {"added": [{"number": p.number, "title": p.title} for p in new_plans],
-                "chapters_total": len(graph.bible.outline)}
+        with self._write_lock(book_id):
+            store = self._store(book_id)
+            graph = self._load_graph_or_404(book_id)
+            new_plans = extend_outline(self._make_llm(bool(meta.get("mock", False)), meta),
+                                       self._settings(book_id, meta), CostLedger(), graph,
+                                       count=count, words_per_chapter=words_per_chapter,
+                                       guidance=guidance)
+            graph.bible.outline.extend(new_plans)
+            graph.bible.target_chapters = len(graph.bible.outline)
+            store.save_graph(graph)
+            return {"added": [{"number": p.number, "title": p.title} for p in new_plans],
+                    "chapters_total": len(graph.bible.outline)}
 
     # ---- KDP packaging ------------------------------------------------
     def _kdp_dir(self, book_id: str) -> str:
@@ -923,7 +987,23 @@ class _LocalBookService:
         # Include any generated chapter images (parity with the HTTP path).
         images = self._store(book_id).collect_images(
             [p.number for p in graph.bible.outline])
-        kit = build_kdp_kit(graph, kdp_meta, self._kdp_dir(book_id), images=images)
+        # Reuse marketing copy cached by an earlier generate_marketing so the
+        # kit ships it (and its path) instead of silently dropping it. Prefer
+        # the kit location (kdp/marketing.json, written by both surfaces and by
+        # build_kdp_kit) but fall back to <book>/marketing.json, where older
+        # HTTP builds cached their snapshot — either copy gets reused.
+        marketing = None
+        for mk_path in (os.path.join(self._kdp_dir(book_id), "marketing.json"),
+                        os.path.join(self._book_dir(book_id), "marketing.json")):
+            if os.path.exists(mk_path):
+                try:
+                    with open(mk_path, "r", encoding="utf-8") as f:
+                        marketing = json.load(f)
+                    break
+                except (OSError, json.JSONDecodeError):
+                    marketing = None
+        kit = build_kdp_kit(graph, kdp_meta, self._kdp_dir(book_id),
+                            images=images, marketing=marketing)
         # Persist <book>/kdp.json so the HTTP readers (get_kdp / epub_path /
         # interior) find MCP-prepared metadata — shared filesystem state.
         _write_json(os.path.join(self._book_dir(book_id), "kdp.json"), kit["metadata"])
@@ -943,11 +1023,30 @@ class _LocalBookService:
             return {"listing": f.read()}
 
     def epub_path(self, book_id: str) -> str:
-        """Return the path to the book's KDP-ready EPUB, building the kit if needed."""
+        """Return the path to the book's KDP-ready EPUB, building it on demand.
+
+        Mirrors the HTTP GET /export/epub contract: prefer the kit built by
+        prepare_kdp; when it's missing, build the EPUB from saved KDP metadata
+        (or a minimal title-only one) — no LLM call needed.
+        """
         self._read_meta(book_id)
         epub = os.path.join(self._kdp_dir(book_id), "manuscript.epub")
-        if not os.path.exists(epub):
-            raise BookNotFound(f"{book_id} has no EPUB; run prepare_kdp first")
+        if os.path.exists(epub):
+            return epub
+        graph = self._load_graph_or_404(book_id)
+        if not graph.chapters:
+            raise BookNotFound(f"{book_id} has no written chapters; write_book first")
+        from bookwriter.kdp import build_epub
+        km = self._kdp_meta_or_minimal(book_id, graph)
+        images = self._store(book_id).collect_images(
+            [p.number for p in graph.bible.outline])
+        # Build the bytes BEFORE opening the file: open("wb") first would leave
+        # a 0-byte manuscript.epub behind if build_epub raised, and every later
+        # call would return that empty file as "already built".
+        data = build_epub(graph, km, images=images)
+        os.makedirs(self._kdp_dir(book_id), exist_ok=True)
+        with open(epub, "wb") as f:
+            f.write(data)
         return epub
 
     # ---- print / royalties / marketing --------------------------------
@@ -1016,12 +1115,19 @@ class _LocalBookService:
         self._read_meta(book_id)
         graph = self._load_graph_or_404(book_id)
         pages = estimate_page_count(graph)
+        # Use the real built EPUB's size for the delivery-fee math when one
+        # exists; else keep the 1.0 MB default assumption.
+        ebook_file_mb = 1.0
+        epub = os.path.join(self._kdp_dir(book_id), "manuscript.epub")
+        if os.path.isfile(epub):
+            ebook_file_mb = os.path.getsize(epub) / 1e6
         return estimate_royalties(
             list_price=float(list_price),
             marketplace=marketplace or "US",
             page_count=pages,
             trim=trim,
             paper=paper or "white",
+            ebook_file_mb=ebook_file_mb,
         )
 
     # ---- AI cover / back cover / PDF (parity with the HTTP service) --------
@@ -1231,7 +1337,11 @@ def build_server():
         words_per_chapter: int = 2000,
         title: str = "",
         genre: str = "",
+        guidance: str = "",
         profile: str = "balanced",
+        provider: str = "",
+        model: str = "",
+        chapter_images: bool = False,
         mock: bool = False,
     ) -> Dict[str, Any]:
         """Plan a new book SYNCHRONOUSLY (bible + characters + chapter outline).
@@ -1244,10 +1354,22 @@ def build_server():
             words_per_chapter: Target words per chapter (default 2000).
             title: Optional title; if empty the planner invents one.
             genre: Optional genre hint (e.g. "science fiction", "cozy mystery").
+            guidance: Optional extra planning instructions (tone, POV, themes,
+                      things to avoid, ...), passed verbatim to the planner.
             profile: Quality profile: "premium", "balanced" (default) or "draft".
                      See list_profiles for the model/cost of each.
+            provider: Optional per-book LLM backend (e.g. "anthropic", "openai",
+                      "openrouter", "grok", "claude-cli"); empty = server default
+                      (BOOKWRITER_LLM_PROVIDER).
+            model: Optional per-book text model for the prose stages; empty =
+                   the profile's default models.
+            chapter_images: If True, generate one inline illustration per
+                            chapter during write_book (best-effort; needs the
+                            configured image backend).
             mock: If True, run fully offline with a deterministic mock model
-                  (no API key, no spend). If False, requires ANTHROPIC_API_KEY.
+                  (no API key, no spend). If False, requires credentials for
+                  the chosen provider (an API key or a signed-in CLI — see
+                  .env.example).
 
         Returns the new book's id, title, genre, chapter counts and the full
         planned `bible` dict (characters, locations, outline, ...).
@@ -1256,7 +1378,8 @@ def build_server():
             return get_service().create_book(
                 premise=premise, chapters=chapters,
                 words_per_chapter=words_per_chapter, title=title, genre=genre,
-                profile=profile, mock=mock,
+                guidance=guidance, profile=profile, provider=provider,
+                model=model, chapter_images=chapter_images, mock=mock,
             )
         except PermissionError as e:
             return {"error": str(e)}
@@ -1264,7 +1387,8 @@ def build_server():
             return {"error": str(e)}
 
     @mcp.tool()
-    def write_book(book_id: str, only: Optional[List[int]] = None) -> Dict[str, Any]:
+    def write_book(book_id: str, only: Optional[List[int]] = None,
+                   restart: bool = False) -> Dict[str, Any]:
         """Write the book's chapters SYNCHRONOUSLY and return when finished.
 
         Resumes from the last unwritten chapter by default, so calling it again
@@ -1274,15 +1398,22 @@ def build_server():
             book_id: The id returned by create_book / list_books.
             only: Optional list of chapter numbers to (re)write, e.g. [1, 2].
                   When omitted, writes all not-yet-written chapters.
+            restart: If True, re-run the whole book from chapter 1 instead of
+                     resuming (rewrites already-written chapters).
 
         Returns chapters_written, chapters_total, the cost snapshot
         (total_cost, words, by_stage, tokens, cache_savings) and any continuity
-        `flags` raised while writing.
+        `flags` raised while writing. A busy book (a write job already running,
+        the MCP equivalent of HTTP 409) returns {"error": ...} like every other
+        failure.
         """
         try:
-            return get_service().write_book(book_id, only=only)
-        except (BookNotFound, PermissionError) as e:
+            return get_service().write_book(book_id, only=only, restart=restart)
+        except (BookNotFound, PermissionError, RuntimeError) as e:
             return {"error": str(e)}
+        except Exception as e:  # provider/SDK failure mid-write — keep the
+            # documented error shape; partial progress is visible via get_status.
+            return {"error": f"write failed: {e}"}
 
     @mcp.tool()
     def write_chapter(book_id: str, number: int) -> Dict[str, Any]:
@@ -1298,8 +1429,10 @@ def build_server():
         """
         try:
             return get_service().write_book(book_id, only=[number])
-        except (BookNotFound, PermissionError) as e:
+        except (BookNotFound, PermissionError, RuntimeError) as e:
             return {"error": str(e)}
+        except Exception as e:  # same contract as write_book
+            return {"error": f"write failed: {e}"}
 
     @mcp.tool()
     def get_status(book_id: str) -> Dict[str, Any]:
@@ -1428,11 +1561,12 @@ def build_server():
 
     @mcp.tool()
     def export_epub(book_id: str) -> Dict[str, Any]:
-        """Return the path to the book's KDP-ready EPUB.
+        """Return the path to the book's KDP-ready EPUB, building it if needed.
 
-        The EPUB is built by prepare_kdp (which embeds the cover and chapter
-        prose). Call prepare_kdp first; this tool returns the path to the
-        already-built `manuscript.epub` in the book's `kdp/` directory.
+        Prefers the kit built by prepare_kdp (which embeds the cover, listing
+        metadata and chapter prose). When prepare_kdp hasn't run yet, builds
+        the EPUB on demand from the written chapters (same as the HTTP export)
+        — the book must be written first.
 
         Returns {"path": <absolute path to manuscript.epub>}.
         """
@@ -1536,8 +1670,10 @@ def build_server():
         alternative blurb variants (different angles), up to 3 Amazon A+ Content
         modules (headline + body), a short third-person author bio, and up to 5
         one-line ad taglines. Every cap is enforced in Python. The result is also
-        cached to `kdp/marketing.json`. Reuses prepare_kdp's metadata when present;
-        runs in mock mode if the book was created with mock=True or no API key.
+        cached to `kdp/marketing.json` (a later prepare_kdp ships it in the kit).
+        Reuses prepare_kdp's metadata when present. Mock books use the
+        deterministic mock copywriter; live books need credentials for the
+        configured provider (else this returns {"error": ...}).
 
         Returns {"blurb_variants": [...], "a_plus_modules": [...],
         "author_bio": str, "taglines": [...]}.
@@ -1598,20 +1734,24 @@ def build_server():
 
     @mcp.tool()
     def import_book(text: str, title: str = "", genre: str = "", guidance: str = "",
-                    analyze: bool = True, mock: bool = False) -> Dict[str, Any]:
+                    profile: str = "balanced", analyze: bool = True,
+                    mock: bool = False) -> Dict[str, Any]:
         """Import pre-written material as a new, fully-editable book.
 
         Splits the manuscript into chapters (on markdown headings or 'Chapter N'
         lines), reverse-engineers the story bible + continuity from the prose when
         a model is available (analyze=True; mock=True for offline), and records
-        every chapter. The result is a normal book you can then revise, continue,
-        illustrate, and publish. Returns the new book id + planned bible (or
-        {"error":...}).
+        every chapter. With analyze=True but no provider credentials it degrades
+        to a structure-only import (chapters recorded, no bible analysis) instead
+        of failing. `profile` picks the quality profile later operations use
+        (see list_profiles). The result is a normal book you can then revise,
+        continue, illustrate, and publish. Returns the new book id + planned
+        bible (or {"error":...}).
         """
         try:
             return get_service().import_book(
                 text=text, title=title, genre=genre, guidance=guidance,
-                analyze=analyze, mock=mock)
+                profile=profile, analyze=analyze, mock=mock)
         except (ValueError, RuntimeError) as e:
             return {"error": str(e)}
 

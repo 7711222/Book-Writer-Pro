@@ -12,9 +12,11 @@ import contextlib
 import json
 import logging
 import os
-from typing import Any, AsyncIterator, Dict
+import re
+from typing import Any, AsyncIterator, Dict, List, Optional
+from urllib.parse import quote, urlsplit
 
-from fastapi import FastAPI, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import (
     FileResponse,
@@ -46,7 +48,175 @@ logger = logging.getLogger(__name__)
 # Heartbeat interval (seconds) for the SSE stream.
 _HEARTBEAT = 15.0
 
+# Request-body cap: comfortably above the largest legal payload (a 5,000,000-
+# char import inside its JSON envelope) while stopping multi-GB memory-DoS
+# bodies before Pydantic ever buffers them.
+_MAX_BODY_BYTES = 12 * 1024 * 1024
+
+# Methods that change server state; cross-site requests carrying a foreign
+# Origin are rejected for these (CSRF / DNS-rebinding hardening).
+_STATE_CHANGING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+
 _WEB_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "web")
+
+
+def _allowed_hosts() -> List[str]:
+    """Host-header allowlist: local names plus the configured bind host.
+
+    The app is unauthenticated, so an unvalidated Host header enables DNS
+    rebinding (a page on attacker.com whose DNS re-resolves to 127.0.0.1 makes
+    same-origin requests that skip CORS entirely). ``testserver`` is what
+    Starlette's TestClient sends.
+    """
+    hosts = ["localhost", "127.0.0.1", "::1", "testserver"]
+    # Normalize a bracketed IPv6 bind ("[::1]") to the bare address.
+    env_host = (os.environ.get("BOOKWRITER_HOST") or "").strip().strip("[]")
+    if env_host and env_host not in hosts:
+        hosts.append(env_host)
+    return hosts
+
+
+def _host_from_header(value: str) -> str:
+    """Hostname from a Host header value: strips the port, and handles IPv6
+    literals ("[::1]:8000" -> "::1"), which a naive split(":") does not."""
+    value = value.strip()
+    if value.startswith("["):
+        end = value.find("]")
+        return value[1:end] if end != -1 else ""
+    return value.split(":")[0]
+
+
+class _HostAllowlistMiddleware:
+    """400 for HTTP requests whose Host header is not in the local allowlist.
+
+    Same intent as Starlette's TrustedHostMiddleware (block DNS rebinding), but
+    parses IPv6 literal hosts correctly — TrustedHostMiddleware's
+    ``host.split(":")[0]`` turns "[::1]:8000" into "[", so a ``::1`` bind (a
+    supported local host per serve.py) would reject every request.
+    """
+
+    def __init__(self, app: Any, allowed_hosts: List[str]) -> None:
+        self.app = app
+        self.allowed = {h.lower() for h in allowed_hosts}
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] == "http":
+            host = ""
+            for k, v in scope.get("headers") or []:
+                if k == b"host":
+                    host = _host_from_header(v.decode("latin-1"))
+                    break
+            if host.lower() not in self.allowed:
+                response = JSONResponse(
+                    status_code=400,
+                    content={"detail": "Invalid host header."},
+                )
+                await response(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
+class _LocalOriginMiddleware:
+    """Reject state-changing requests whose Origin is not a local page.
+
+    CORS only governs whether cross-origin JS may *read* responses; a simple
+    no-preflight POST still executes server-side. Requests without an Origin
+    header (same-origin navigations, curl, tests) pass through.
+    """
+
+    def __init__(self, app: Any, allowed_hostnames: List[str]) -> None:
+        self.app = app
+        self.allowed = {h.lower() for h in allowed_hostnames}
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] == "http" and scope.get("method") in _STATE_CHANGING_METHODS:
+            origin = ""
+            for k, v in scope.get("headers") or []:
+                if k == b"origin":
+                    origin = v.decode("latin-1")
+                    break
+            if origin and not self._origin_allowed(origin):
+                response = JSONResponse(
+                    status_code=403,
+                    content={"detail": "Cross-origin request rejected."},
+                )
+                await response(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+    def _origin_allowed(self, origin: str) -> bool:
+        try:
+            hostname = urlsplit(origin).hostname
+        except ValueError:
+            return False
+        return bool(hostname) and hostname.lower() in self.allowed
+
+
+class _BodySizeLimitMiddleware:
+    """413 for request bodies over the cap — before they are fully buffered.
+
+    Checks the declared Content-Length up front, and counts streamed (chunked)
+    body bytes as they arrive. The mid-stream abort raises HTTPException, which
+    FastAPI explicitly re-raises from middleware so the registered handler
+    returns the API's usual ``{"detail": ...}`` shape.
+    """
+
+    def __init__(self, app: Any, max_bytes: int = _MAX_BODY_BYTES) -> None:
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        for k, v in scope.get("headers") or []:
+            if k == b"content-length":
+                try:
+                    too_big = int(v) > self.max_bytes
+                except ValueError:
+                    too_big = False
+                if too_big:
+                    response = JSONResponse(
+                        status_code=413,
+                        content={"detail": "Request body too large."},
+                    )
+                    await response(scope, receive, send)
+                    return
+                break
+
+        seen = 0
+
+        async def limited_receive() -> Dict[str, Any]:
+            nonlocal seen
+            message = await receive()
+            if message["type"] == "http.request":
+                seen += len(message.get("body", b"") or b"")
+                if seen > self.max_bytes:
+                    raise HTTPException(status_code=413, detail="Request body too large.")
+            return message
+
+        await self.app(scope, limited_receive, send)
+
+
+def _content_disposition(filename: str, disposition: str = "attachment") -> str:
+    """Content-Disposition with an ASCII fallback + RFC 5987 UTF-8 filename*.
+
+    Starlette encodes header values as latin-1, so a raw non-ASCII filename
+    (e.g. a Cyrillic book title) would raise UnicodeEncodeError -> 500. The
+    primary ``filename=`` is reduced to ASCII; browsers that understand
+    ``filename*`` pick the real UTF-8 name.
+    """
+    if "." in filename:
+        stem, ext = filename.rsplit(".", 1)
+        ext = "." + re.sub(r"[^A-Za-z0-9]+", "", ext)
+    else:
+        stem, ext = filename, ""
+    ascii_stem = re.sub(r"[^A-Za-z0-9-_ ]+", "", stem).strip(" -_.")
+    fallback = (ascii_stem or "book") + ext
+    header = f'{disposition}; filename="{fallback}"'
+    if filename != fallback:
+        header += f"; filename*=UTF-8''{quote(filename, safe='')}"
+    return header
 
 
 def _default_data_dir() -> str:
@@ -78,6 +248,8 @@ def create_app(data_dir: str | None = None) -> FastAPI:
 
     from .. import __version__
     app = FastAPI(title="BookwriterPro", version=__version__, lifespan=_lifespan)
+    # Expose the service for embedders/tests (TestClient reaches it via app.state).
+    app.state.service = service
 
     app.add_middleware(
         CORSMiddleware,
@@ -94,6 +266,26 @@ def create_app(data_dir: str | None = None) -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    # BOOKWRITER_ALLOW_REMOTE=1 is the explicit opt-in for non-local exposure
+    # (serve.py requires an auth proxy + TLS in front). Host/Origin enforcement
+    # would reject the proxied public hostname (and any 0.0.0.0 bind), so it
+    # only applies in the default local-only mode.
+    allow_remote = os.environ.get("BOOKWRITER_ALLOW_REMOTE") == "1"
+    allowed_hosts = _allowed_hosts()
+    if not allow_remote:
+        # Reject foreign-Origin state changes (no-preflight CSRF) before they
+        # reach the routes.
+        app.add_middleware(_LocalOriginMiddleware, allowed_hostnames=allowed_hosts)
+    app.add_middleware(_BodySizeLimitMiddleware)
+    if not allow_remote:
+        # Outermost: an unexpected Host header (DNS rebinding) never reaches the app.
+        app.add_middleware(_HostAllowlistMiddleware, allowed_hosts=allowed_hosts)
+    else:
+        logger.warning(
+            "BOOKWRITER_ALLOW_REMOTE=1: Host/Origin request hardening is OFF — "
+            "the reverse proxy in front must authenticate requests and enforce "
+            "its own Host/Origin checks."
+        )
 
     # -- error handling -------------------------------------------------
     @app.exception_handler(ServiceError)
@@ -214,18 +406,19 @@ def create_app(data_dir: str | None = None) -> FastAPI:
 
     @app.get("/api/books/{book_id}/manuscript")
     async def get_manuscript(book_id: str, download: int = Query(0)) -> Any:
-        data = service.get_manuscript(book_id)
+        # Full-book assembly reads every chapter and writes manuscript.md — keep
+        # it off the event loop so SSE streams don't stall while it runs.
+        data = await asyncio.to_thread(service.get_manuscript, book_id)
         if download:
             try:
                 meta = service._require_meta(book_id)  # noqa: SLF001 - internal helper
                 fname = (meta.get("title") or book_id) or book_id
             except ServiceError:
                 fname = book_id
-            safe = "".join(ch if ch.isalnum() or ch in "-_ " else "_" for ch in fname).strip() or book_id
             return Response(
                 content=data["markdown"],
                 media_type="text/markdown",
-                headers={"Content-Disposition": f'attachment; filename="{safe}.md"'},
+                headers={"Content-Disposition": _content_disposition(f"{fname}.md")},
             )
         return data
 
@@ -253,8 +446,7 @@ def create_app(data_dir: str | None = None) -> FastAPI:
         return FileResponse(
             path,
             media_type="application/epub+zip",
-            filename=fname,
-            headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+            headers={"Content-Disposition": _content_disposition(fname)},
         )
 
     # -- AI cover / back cover / PDF exports ---------------------------
@@ -270,7 +462,7 @@ def create_app(data_dir: str | None = None) -> FastAPI:
         return Response(
             content=svg,
             media_type="image/svg+xml",
-            headers={"Content-Disposition": f'inline; filename="{fname}"'},
+            headers={"Content-Disposition": _content_disposition(fname, "inline")},
         )
 
     @app.get("/api/books/{book_id}/export/pdf")
@@ -279,7 +471,7 @@ def create_app(data_dir: str | None = None) -> FastAPI:
         return Response(
             content=data,
             media_type="application/pdf",
-            headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+            headers={"Content-Disposition": _content_disposition(fname)},
         )
 
     # -- Print / pricing / marketing -----------------------------------
@@ -290,8 +482,7 @@ def create_app(data_dir: str | None = None) -> FastAPI:
         return FileResponse(
             path,
             media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            filename=fname,
-            headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+            headers={"Content-Disposition": _content_disposition(fname)},
         )
 
     @app.get("/api/books/{book_id}/print")
@@ -305,7 +496,7 @@ def create_app(data_dir: str | None = None) -> FastAPI:
         return Response(
             content=svg,
             media_type="image/svg+xml",
-            headers={"Content-Disposition": f'inline; filename="{fname}"'},
+            headers={"Content-Disposition": _content_disposition(fname, "inline")},
         )
 
     @app.post("/api/books/{book_id}/pricing")
@@ -324,18 +515,42 @@ def create_app(data_dir: str | None = None) -> FastAPI:
 
     # -- SSE ------------------------------------------------------------
     @app.get("/api/books/{book_id}/events")
-    async def events(book_id: str, request: Request) -> StreamingResponse:
+    async def events(book_id: str, request: Request) -> Response:
         # 404 if the book does not exist.
         service._require_meta(book_id)  # noqa: SLF001 - raises ServiceError -> handled
 
+        # Every event carries an ``id:`` (the broker's per-book seq), so an
+        # EventSource reconnect sends Last-Event-ID and we can avoid replaying
+        # what the client already has.
+        raw_last = request.headers.get("last-event-id")
+        last_seq = -1
+        if raw_last is not None:
+            try:
+                last_seq = int(raw_last)
+            except ValueError:
+                last_seq = -1
+
         q, replay, finished = broker.subscribe(book_id)
+
+        # Terminal semantics: a reconnecting client that already received the
+        # finished job's terminal event gets 204, which the EventSource spec
+        # defines as "stop reconnecting" — otherwise every idle Studio tab
+        # would replay the full ring (megabytes of prose) every ~3 seconds.
+        if raw_last is not None and finished:
+            max_seq = replay[-1][0] if replay else -1
+            if last_seq >= max_seq:
+                broker.unsubscribe(book_id, q)
+                return Response(status_code=204)
 
         async def gen():
             try:
-                # Replay everything emitted so far for the current/last job.
+                # Replay everything emitted so far for the current/last job
+                # that the client has not already seen.
                 saw_terminal = False
-                for ev in replay:
-                    yield _sse(ev)
+                for seq, ev in replay:
+                    if seq <= last_seq:
+                        continue
+                    yield _sse(ev, seq)
                     if ev.get("type") in TERMINAL_TYPES:
                         saw_terminal = True
                 # If the last job already finished and we replayed its terminal
@@ -347,11 +562,11 @@ def create_app(data_dir: str | None = None) -> FastAPI:
                     if await request.is_disconnected():
                         return
                     try:
-                        ev = await asyncio.wait_for(q.get(), timeout=_HEARTBEAT)
+                        seq, ev = await asyncio.wait_for(q.get(), timeout=_HEARTBEAT)
                     except asyncio.TimeoutError:
                         yield ":\n\n"  # comment heartbeat
                         continue
-                    yield _sse(ev)
+                    yield _sse(ev, seq)
                     if ev.get("type") in TERMINAL_TYPES:
                         return
             finally:
@@ -387,5 +602,8 @@ def create_app(data_dir: str | None = None) -> FastAPI:
     return app
 
 
-def _sse(event: Dict[str, Any]) -> str:
-    return "data: " + json.dumps(event, ensure_ascii=False) + "\n\n"
+def _sse(event: Dict[str, Any], seq: Optional[int] = None) -> str:
+    data = "data: " + json.dumps(event, ensure_ascii=False) + "\n\n"
+    if seq is None:
+        return data
+    return f"id: {seq}\n{data}"

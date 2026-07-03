@@ -299,7 +299,13 @@
     const overlay = Palette.el;
     if (!overlay) return;
     Palette.el = null;
-    document.body.classList.remove("cmdk-lock");
+    // Keep the scroll lock if another locking overlay is still open beneath
+    // (help modal, or the Create/Settings/Import dialogs in app.js — the latter
+    // all share the .create-overlay root class). Overlays mid-fade keep their
+    // root class ~280ms, so skip anything .is-closing.
+    if (!document.querySelector(".help-overlay:not(.is-closing), .create-overlay:not(.is-closing)")) {
+      document.body.classList.remove("cmdk-lock");
+    }
 
     const finish = () => { overlay.remove(); };
     if (prefersReduced()) finish();
@@ -495,11 +501,17 @@
     const overlay = ShortcutsHelp.el;
     if (!overlay) return;
     ShortcutsHelp.el = null;
-    if (!Palette.el) document.body.classList.remove("cmdk-lock");
+    // As in closePalette: release the lock only when nothing else locks scroll.
+    if (!Palette.el && !document.querySelector(".create-overlay:not(.is-closing)")) {
+      document.body.classList.remove("cmdk-lock");
+    }
     const finish = () => overlay.remove();
     if (prefersReduced()) finish();
     else {
+      // Tag the fade-out so the other overlays' lock-release checks (which all
+      // skip .is-closing) don't count this node as "still open".
       overlay.classList.remove("is-open");
+      overlay.classList.add("is-closing");
       let done = false;
       const onEnd = () => { if (done) return; done = true; finish(); };
       overlay.addEventListener("transitionend", onEnd, { once: true });
